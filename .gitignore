@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+
+# 記録データ（ユーザーごとに生成される）
+recipes/
+
+# adb を同梱した場合
+adb.exe
+*.dll
+
+# OS
+.DS_Store
+Thumbs.db

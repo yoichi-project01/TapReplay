@@ -1,0 +1,5 @@
+uiautomator2
+opencv-python
+numpy
+pillow
+PySide6
