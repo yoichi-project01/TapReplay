@@ -262,19 +262,18 @@ class PlayerThread(QtCore.QThread):
                 pass
         self.sig_log.emit(msg)
 
-    def _find_other_match(self, gray, current_step, all_steps):
-        """現在待っている画像以外に、レシピ内の別のステップ画像が
-        今の画面に写っていないか探す（想定外のポップアップ等からの復帰用）"""
+    def _find_later_match(self, gray, later_steps):
+        """現在待っている画像がまだ見つからないとき、レシピ内の"これより後の"
+        ステップ画像が今の画面に写っていないか探す（想定外のポップアップ等からの復帰用）。
+        既に完了した前のステップは対象にしない(誤って前の操作を踏み直さないため)"""
         best = None
-        for s in all_steps:
-            if s is current_step:
-                continue
+        for s in later_steps:
             cx, cy, val = core.match(gray, s["_gray"], self.threshold)
             if cx is not None and (best is None or val > best[3]):
                 best = (s, cx, cy, val)
         return best
 
-    def _wait_and_tap(self, d, step, all_steps):
+    def _wait_and_tap(self, d, step, later_steps):
         import random
         deadline = time.time() + self.step_timeout
         best = 0.0
@@ -316,15 +315,16 @@ class PlayerThread(QtCore.QThread):
                     "遷移しませんでした(同じ場所を押しても無反応)")
 
             # 対象の画像が見つからない → 想定外の画面(広告・確認ダイアログ等)の
-            # 可能性があるので、レシピ内の他のステップ画像が写っていないか探す
-            other = self._find_other_match(gray, step, all_steps)
+            # 可能性があるので、レシピ内の"これより後の"ステップ画像が
+            # 写っていないか探す(前のステップは対象にしない)
+            other = self._find_later_match(gray, later_steps)
             if other is not None:
                 other_step, ocx, ocy, oval = other
                 jx = ocx + random.randint(-self.jitter, self.jitter)
                 jy = ocy + random.randint(-self.jitter, self.jitter)
                 core.tap(self._serial, jx, jy, self.hold_ms)
                 self._log(
-                    f"    !! {step['label']} は見つかりませんが、レシピ内の別画像"
+                    f"    !! {step['label']} は見つかりませんが、この先のステップ画像"
                     f"「{other_step['label']}」を検知(一致{oval:.2f})したのでタップしました")
                 time.sleep(self.after)
                 continue
@@ -367,7 +367,7 @@ class PlayerThread(QtCore.QThread):
             self._log(f"再生開始: {len(data['steps'])}ステップ / "
                       f"{'無限' if self.loops == 0 else self.loops}周")
 
-            ok = ng = cycle = 0
+            ok = ng_total = ng_streak = cycle = 0
             started = time.time()
             while self.loops == 0 or cycle < self.loops:
                 if self._stop:
@@ -376,18 +376,20 @@ class PlayerThread(QtCore.QThread):
                 self._log(f"=== ループ {cycle} ===")
                 current_step = None
                 try:
-                    for step in data["steps"]:
+                    for idx, step in enumerate(data["steps"]):
                         current_step = step
-                        self._wait_and_tap(d, step, data["steps"])
+                        self._wait_and_tap(d, step, data["steps"][idx + 1:])
                     ok += 1
-                    self.sig_cycle.emit(ok, ng)
+                    ng_streak = 0  # 連続失敗カウントは成功したらリセット
+                    self.sig_cycle.emit(ok, ng_total)
                     avg = (time.time() - started) / cycle
                     self._log(f"=== ループ {cycle} 完了  平均 {avg:.0f}秒/回 ===")
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
-                    ng += 1
-                    self.sig_cycle.emit(ok, ng)
+                    ng_total += 1
+                    ng_streak += 1
+                    self.sig_cycle.emit(ok, ng_total)
                     self._log(f"!! ループ {cycle} 失敗: {e}")
                     safe_reason = "".join(
                         c if c.isalnum() else "_" for c in str(e))[:40]
@@ -395,15 +397,15 @@ class PlayerThread(QtCore.QThread):
                     core.imwrite(recipe_dir / fname, core.to_gray(d.screenshot()))
                     step_label = current_step["label"] if current_step else "?"
                     core.append_failure(self.name, step_label, str(e), fname)
-                    if ng >= self.max_fail:
-                        self._log("!! 失敗が続くため停止します")
+                    if ng_streak >= self.max_fail:
+                        self._log(f"!! 失敗が{ng_streak}回連続したため停止します")
                         break
                     d.press("back")
                     time.sleep(3)
                 time.sleep(1)
 
             total = (time.time() - started) / 60
-            self._log(f"終了: 成功{ok} / 失敗{ng} / {total:.1f}分")
+            self._log(f"終了: 成功{ok} / 失敗{ng_total} / {total:.1f}分")
         except Exception as e:
             self._log(f"!! 再生エラー: {e}")
         finally:
