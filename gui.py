@@ -26,6 +26,13 @@ from PySide6 import QtWidgets, QtCore, QtGui
 
 import core
 
+# レシピ名はフォルダ名としてそのまま使われるため、パス区切りなどは禁止する
+INVALID_NAME_CHARS = '\\/:*?"<>|'
+
+
+def is_valid_recipe_name(name):
+    return bool(name) and not any(c in INVALID_NAME_CHARS for c in name)
+
 
 def pil_to_qpix(pil_img):
     buf = io.BytesIO()
@@ -92,12 +99,39 @@ class RecorderDialog(QtWidgets.QDialog):
         for b in (b_refresh, b_undo, b_save, b_cancel):
             side.addWidget(b)
 
+        side.addWidget(QtWidgets.QLabel("記録したステップ（ダブルクリックで名前変更）"))
+        self.list_steps_edit = QtWidgets.QListWidget()
+        self.list_steps_edit.setMaximumHeight(140)
+        self.list_steps_edit.itemChanged.connect(self.on_step_label_edited)
+        side.addWidget(self.list_steps_edit)
+
         self.log = QtWidgets.QPlainTextEdit(); self.log.setReadOnly(True)
         side.addWidget(self.log, 1)
         root.addLayout(side)
 
         self._load_existing()
+        self._refresh_step_list()
         self.refresh()
+
+    def _refresh_step_list(self):
+        self.list_steps_edit.blockSignals(True)
+        self.list_steps_edit.clear()
+        for s in self.steps:
+            item = QtWidgets.QListWidgetItem(s["label"])
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+            self.list_steps_edit.addItem(item)
+        self.list_steps_edit.blockSignals(False)
+
+    def on_step_label_edited(self, item):
+        idx = self.list_steps_edit.row(item)
+        if not (0 <= idx < len(self.steps)):
+            return
+        new_label = item.text().strip()
+        if new_label:
+            self.steps[idx]["label"] = new_label
+            self._msg(f"step{idx + 1} の名前を「{new_label}」に変更しました")
+        else:
+            item.setText(self.steps[idx]["label"])  # 空にはできない
 
     def _load_existing(self):
         """同名レシピが既にあれば、続きから記録するか確認して読み込む"""
@@ -184,6 +218,7 @@ class RecorderDialog(QtWidgets.QDialog):
         core.imwrite(self.dir / f"context_{idx:02d}.png", ctx)
         self.steps.append({"label": f"タップ{idx}", "template": tpl, "x": rx, "y": ry})
         self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
+        self._refresh_step_list()
 
         if self.ck_send.isChecked():
             try:
@@ -209,6 +244,7 @@ class RecorderDialog(QtWidgets.QDialog):
             except Exception:
                 pass
         self._msg(f"step{idx} を取り消しました")
+        self._refresh_step_list()
         self.refresh()
 
     def save(self):
@@ -500,9 +536,14 @@ class MainWindow(QtWidgets.QWidget):
         tab_hist = QtWidgets.QWidget()
         hv = QtWidgets.QVBoxLayout(tab_hist)
 
+        hist_btn_row = QtWidgets.QHBoxLayout()
         btn_refresh_hist = QtWidgets.QPushButton("表示を更新（上のレシピ名を対象）")
         btn_refresh_hist.clicked.connect(self.refresh_history)
-        hv.addWidget(btn_refresh_hist)
+        hist_btn_row.addWidget(btn_refresh_hist, 1)
+        btn_clear_hist = QtWidgets.QPushButton("失敗履歴・ログを消去")
+        btn_clear_hist.clicked.connect(self.on_clear_history)
+        hist_btn_row.addWidget(btn_clear_hist)
+        hv.addLayout(hist_btn_row)
 
         box = QtWidgets.QGroupBox("記録したステップ")
         bl = QtWidgets.QVBoxLayout(box)
@@ -585,6 +626,9 @@ class MainWindow(QtWidgets.QWidget):
         if not name:
             self.append("!! レシピ名を入れてください")
             return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
         try:
             dlg = RecorderDialog(self.serial, name,
                                  self.sp_w.value(), self.sp_h.value(), self)
@@ -601,6 +645,9 @@ class MainWindow(QtWidgets.QWidget):
         name = self.cmb_recipe.currentText().strip()
         if not name:
             self.append("!! レシピ名を入れてください")
+            return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
             return
         self.worker = PlayerThread(
             self.serial, name,
@@ -633,6 +680,40 @@ class MainWindow(QtWidgets.QWidget):
         if self.tabs.tabText(index) == "確認":
             self.refresh_history()
 
+    def on_clear_history(self):
+        name = self.cmb_recipe.currentText().strip()
+        if not name:
+            self.append("!! レシピ名を入れてください")
+            return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
+        d = core.recipe_dir(name)
+        targets = (list(d.glob("error_*.png")) + list(d.glob("playback_*.log")) +
+                   list(d.glob("failures.jsonl")))
+        if not targets:
+            self.append(f"「{name}」に消去する失敗履歴・ログはありません")
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self, "失敗履歴・ログを消去",
+            f"「{name}」の失敗スクリーンショット・再生ログ・失敗履歴"
+            f"（計{len(targets)}件）を削除します。\n"
+            "記録したレシピ本体（ステップ画像）は削除されません。よろしいですか？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        removed = 0
+        for f in targets:
+            try:
+                f.unlink()
+                removed += 1
+            except Exception as e:
+                self.append(f"!! 削除失敗: {f.name} ({e})")
+        self.append(f"「{name}」の失敗履歴・ログを{removed}件消去しました")
+        self.refresh_history()
+
     def refresh_history(self):
         name = self.cmb_recipe.currentText().strip()
         self.list_steps.clear()
@@ -655,7 +736,12 @@ class MainWindow(QtWidgets.QWidget):
                 item = QtWidgets.QListWidgetItem(f"{i}. {s.get('label', '?')}")
                 ctx = d / f"context_{i:02d}.png"
                 if ctx.exists():
-                    item.setIcon(QtGui.QIcon(str(ctx)))
+                    # フルサイズ画像をそのままQIconにすると重いので縮小してから使う
+                    pix = QtGui.QPixmap(str(ctx))
+                    if not pix.isNull():
+                        pix = pix.scaled(64, 64, QtCore.Qt.KeepAspectRatio,
+                                          QtCore.Qt.SmoothTransformation)
+                        item.setIcon(QtGui.QIcon(pix))
                 self.list_steps.addItem(item)
         else:
             self.list_steps.addItem("(このレシピはまだ記録されていません)")
