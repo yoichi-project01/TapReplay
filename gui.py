@@ -16,6 +16,7 @@ Android 端末の画面操作を記録し、あとから再生する汎用ツー
 """
 
 import io
+import json
 import time
 import datetime
 
@@ -95,7 +96,46 @@ class RecorderDialog(QtWidgets.QDialog):
         side.addWidget(self.log, 1)
         root.addLayout(side)
 
+        self._load_existing()
         self.refresh()
+
+    def _load_existing(self):
+        """同名レシピが既にあれば、続きから記録するか確認して読み込む"""
+        recipe_file = self.dir / "recipe.json"
+        if not recipe_file.exists():
+            return
+        try:
+            data = json.loads(recipe_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            self._msg(f"!! 既存レシピの読み込みに失敗: {e}")
+            return
+        prev_steps = data.get("steps", [])
+        if not prev_steps:
+            return
+
+        resp = QtWidgets.QMessageBox.question(
+            self, "既存レシピが見つかりました",
+            f"「{self.name}」には既に{len(prev_steps)}ステップ記録されています。\n\n"
+            "「はい」: プログラムが止まった続きから追加記録する\n"
+            "「いいえ」: 最初からやり直す（既存の記録は削除されます）",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        if resp == QtWidgets.QMessageBox.Yes:
+            self.steps = prev_steps
+            self._msg(f"続きから記録します（{len(prev_steps)}ステップ目まで読み込み済み）")
+            dev_size = data.get("device_size")
+            if dev_size and list(dev_size) != [self.sw, self.sh]:
+                self._msg(
+                    f"!! 注意: 記録時({dev_size})と今の画面サイズ"
+                    f"({self.sw},{self.sh})が違います")
+        else:
+            for f in list(self.dir.glob("step_*.png")) + list(self.dir.glob("context_*.png")):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+            self._msg("既存の記録を削除し、最初から記録します")
 
     def _msg(self, m):
         self.log.appendPlainText(m)
@@ -106,8 +146,10 @@ class RecorderDialog(QtWidgets.QDialog):
         except Exception as e:
             self._msg(f"!! スクショ失敗: {e}")
             return
-        maxh = 680
-        self.scale = min(1.0, maxh / self.sh)
+        avail = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        maxh = int(avail.height() * 0.85)
+        maxw = int(avail.width() * 0.6)
+        self.scale = min(1.0, maxh / self.sh, maxw / self.sw)
         disp = self.pil.resize(
             (int(self.sw * self.scale), int(self.sh * self.scale)))
         pix = pil_to_qpix(disp)
@@ -139,7 +181,7 @@ class RecorderDialog(QtWidgets.QDialog):
                       (rx - self.tpl_w // 2, ry - self.tpl_h // 2),
                       (rx + self.tpl_w // 2, ry + self.tpl_h // 2),
                       (0, 0, 255), 4)
-        cv2.imwrite(str(self.dir / f"context_{idx:02d}.png"), ctx)
+        core.imwrite(self.dir / f"context_{idx:02d}.png", ctx)
         self.steps.append({"label": f"タップ{idx}", "template": tpl, "x": rx, "y": ry})
         self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
 
@@ -205,11 +247,34 @@ class PlayerThread(QtCore.QThread):
         self.hold_ms = hold_ms
         self._serial = serial
         self._stop = False
+        self._log_file = None
 
     def stop(self):
         self._stop = True
 
-    def _wait_and_tap(self, d, step):
+    def _log(self, msg):
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        if self._log_file:
+            try:
+                self._log_file.write(f"[{stamp}] {msg}\n")
+                self._log_file.flush()
+            except Exception:
+                pass
+        self.sig_log.emit(msg)
+
+    def _find_other_match(self, gray, current_step, all_steps):
+        """現在待っている画像以外に、レシピ内の別のステップ画像が
+        今の画面に写っていないか探す（想定外のポップアップ等からの復帰用）"""
+        best = None
+        for s in all_steps:
+            if s is current_step:
+                continue
+            cx, cy, val = core.match(gray, s["_gray"], self.threshold)
+            if cx is not None and (best is None or val > best[3]):
+                best = (s, cx, cy, val)
+        return best
+
+    def _wait_and_tap(self, d, step, all_steps):
         import random
         deadline = time.time() + self.step_timeout
         best = 0.0
@@ -230,7 +295,7 @@ class PlayerThread(QtCore.QThread):
                     jy = cy + random.randint(-self.jitter, self.jitter)
                     core.tap(self._serial, jx, jy, self.hold_ms)
                     tag = f" [{attempt}回目]" if attempt > 1 else ""
-                    self.sig_log.emit(
+                    self._log(
                         f"    {step['label']}: タップ({jx},{jy}) 一致{val:.2f}{tag}")
                     time.sleep(self.after)
                     if not self.verify:
@@ -241,17 +306,33 @@ class PlayerThread(QtCore.QThread):
                         return  # ボタンが消えた＝タップ成功、次へ
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
                     cx, cy = ncx, ncy
-                    self.sig_log.emit(
+                    self._log(
                         f"    …まだボタンが残っています(一致{nval:.2f})。押し直します")
-                self.sig_log.emit(
+                self._log(
                     f"    !! {step['label']}: 押しても反応しません。"
                     "「タップ長押しms」を80〜150に上げてみてください")
-                return
+                raise RuntimeError(
+                    f"{step['label']}: {self.tap_retry}回タップしても次の画面に"
+                    "遷移しませんでした(同じ場所を押しても無反応)")
+
+            # 対象の画像が見つからない → 想定外の画面(広告・確認ダイアログ等)の
+            # 可能性があるので、レシピ内の他のステップ画像が写っていないか探す
+            other = self._find_other_match(gray, step, all_steps)
+            if other is not None:
+                other_step, ocx, ocy, oval = other
+                jx = ocx + random.randint(-self.jitter, self.jitter)
+                jy = ocy + random.randint(-self.jitter, self.jitter)
+                core.tap(self._serial, jx, jy, self.hold_ms)
+                self._log(
+                    f"    !! {step['label']} は見つかりませんが、レシピ内の別画像"
+                    f"「{other_step['label']}」を検知(一致{oval:.2f})したのでタップしました")
+                time.sleep(self.after)
+                continue
 
             # まだ見つからない → 数秒おきに現在の一致度を報告
             if time.time() - last_report >= 3:
                 last_report = time.time()
-                self.sig_log.emit(
+                self._log(
                     f"    待機中… {step['label']} 最高一致度 {best:.2f} "
                     f"(しきい値 {self.threshold:.2f})")
             time.sleep(self.poll)
@@ -267,18 +348,24 @@ class PlayerThread(QtCore.QThread):
             f"{step['label']} が出現せず (最高一致度 {best:.2f}) {hint}")
 
     def run(self):
+        recipe_dir = core.recipe_dir(self.name)
+        log_path = recipe_dir / f"playback_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
+        try:
+            self._log_file = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            self._log_file = None
         try:
             d = core.connect(self.serial)
             self._serial = self.serial or d.serial
             data = core.load_recipe(self.name)
             sw, sh = d.window_size()
             if data.get("device_size") and list(data["device_size"]) != [sw, sh]:
-                self.sig_log.emit(
+                self._log(
                     f"!! 注意: 記録時({data['device_size']})と画面サイズが違います。"
                     "解像度・向きを合わせてください"
                 )
-            self.sig_log.emit(f"再生開始: {len(data['steps'])}ステップ / "
-                              f"{'無限' if self.loops == 0 else self.loops}周")
+            self._log(f"再生開始: {len(data['steps'])}ステップ / "
+                      f"{'無限' if self.loops == 0 else self.loops}周")
 
             ok = ng = cycle = 0
             started = time.time()
@@ -286,37 +373,45 @@ class PlayerThread(QtCore.QThread):
                 if self._stop:
                     break
                 cycle += 1
-                self.sig_log.emit(f"=== ループ {cycle} ===")
+                self._log(f"=== ループ {cycle} ===")
+                current_step = None
                 try:
                     for step in data["steps"]:
-                        self._wait_and_tap(d, step)
+                        current_step = step
+                        self._wait_and_tap(d, step, data["steps"])
                     ok += 1
                     self.sig_cycle.emit(ok, ng)
                     avg = (time.time() - started) / cycle
-                    self.sig_log.emit(f"=== ループ {cycle} 完了  平均 {avg:.0f}秒/回 ===")
+                    self._log(f"=== ループ {cycle} 完了  平均 {avg:.0f}秒/回 ===")
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
                     ng += 1
                     self.sig_cycle.emit(ok, ng)
-                    self.sig_log.emit(f"!! ループ {cycle} 失敗: {e}")
-                    cv2.imwrite(
-                        str(core.recipe_dir(self.name) /
-                            f"error_{datetime.datetime.now():%H%M%S}.png"),
-                        core.to_gray(d.screenshot())
-                    )
+                    self._log(f"!! ループ {cycle} 失敗: {e}")
+                    safe_reason = "".join(
+                        c if c.isalnum() else "_" for c in str(e))[:40]
+                    fname = f"error_{datetime.datetime.now():%H%M%S}_{safe_reason}.png"
+                    core.imwrite(recipe_dir / fname, core.to_gray(d.screenshot()))
+                    step_label = current_step["label"] if current_step else "?"
+                    core.append_failure(self.name, step_label, str(e), fname)
                     if ng >= self.max_fail:
-                        self.sig_log.emit("!! 失敗が続くため停止します")
+                        self._log("!! 失敗が続くため停止します")
                         break
                     d.press("back")
                     time.sleep(3)
                 time.sleep(1)
 
             total = (time.time() - started) / 60
-            self.sig_log.emit(f"終了: 成功{ok} / 失敗{ng} / {total:.1f}分")
+            self._log(f"終了: 成功{ok} / 失敗{ng} / {total:.1f}分")
         except Exception as e:
-            self.sig_log.emit(f"!! 再生エラー: {e}")
+            self._log(f"!! 再生エラー: {e}")
         finally:
+            if self._log_file:
+                try:
+                    self._log_file.close()
+                except Exception:
+                    pass
             self.sig_done.emit()
 
 
@@ -325,7 +420,7 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TapReplay — Android 記録＆再生")
-        self.resize(560, 640)
+        self.resize(560, 700)
         self.serial = None
         self.worker = None
 
@@ -347,12 +442,16 @@ class MainWindow(QtWidgets.QWidget):
         self.cmb_recipe = QtWidgets.QComboBox()
         self.cmb_recipe.setEditable(True)
         self.cmb_recipe.addItems(core.list_recipes())
-        self.cmb_recipe.setCurrentText("sample")
         row.addWidget(QtWidgets.QLabel("レシピ名:"))
         row.addWidget(self.cmb_recipe, 1)
         v.addLayout(row)
 
-        # 記録設定
+        # タブ（記録設定 / 再生設定）
+        tabs = QtWidgets.QTabWidget()
+
+        # --- 記録タブ ---
+        tab_rec = QtWidgets.QWidget()
+        tv = QtWidgets.QVBoxLayout(tab_rec)
         box = QtWidgets.QGroupBox("記録の設定（画面をクリックして記録）")
         g = QtWidgets.QGridLayout(box)
         self.sp_w = QtWidgets.QSpinBox(); self.sp_w.setRange(40, 800); self.sp_w.setValue(200)
@@ -362,9 +461,13 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_rec = QtWidgets.QPushButton("記録開始")
         self.btn_rec.clicked.connect(self.on_record)
         g.addWidget(self.btn_rec, 1, 0, 1, 4)
-        v.addWidget(box)
+        tv.addWidget(box)
+        tv.addStretch(1)
+        tabs.addTab(tab_rec, "記録")
 
-        # 再生設定
+        # --- 再生タブ ---
+        tab_play = QtWidgets.QWidget()
+        pv = QtWidgets.QVBoxLayout(tab_play)
         box = QtWidgets.QGroupBox("再生の設定")
         g = QtWidgets.QGridLayout(box)
         self.sp_loops = QtWidgets.QSpinBox(); self.sp_loops.setRange(0, 100000); self.sp_loops.setValue(0)
@@ -387,7 +490,56 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_play = QtWidgets.QPushButton("再生開始")
         self.btn_play.clicked.connect(self.on_play)
         g.addWidget(self.btn_play, 4, 0, 1, 4)
-        v.addWidget(box)
+        pv.addWidget(box)
+        pv.addStretch(1)
+        tabs.addTab(tab_play, "再生")
+
+        # --- 確認タブ（記録内容・よく止まる箇所） ---
+        tab_hist = QtWidgets.QWidget()
+        hv = QtWidgets.QVBoxLayout(tab_hist)
+
+        btn_refresh_hist = QtWidgets.QPushButton("表示を更新（上のレシピ名を対象）")
+        btn_refresh_hist.clicked.connect(self.refresh_history)
+        hv.addWidget(btn_refresh_hist)
+
+        box = QtWidgets.QGroupBox("記録したステップ")
+        bl = QtWidgets.QVBoxLayout(box)
+        self.list_steps = QtWidgets.QListWidget()
+        self.list_steps.setIconSize(QtCore.QSize(64, 64))
+        self.list_steps.setMaximumHeight(160)
+        bl.addWidget(self.list_steps)
+        hv.addWidget(box)
+
+        box = QtWidgets.QGroupBox("よく止まる箇所（失敗回数の多い順）")
+        bl = QtWidgets.QVBoxLayout(box)
+        self.tbl_rank = QtWidgets.QTableWidget(0, 2)
+        self.tbl_rank.setHorizontalHeaderLabels(["ステップ", "失敗回数"])
+        self.tbl_rank.horizontalHeader().setStretchLastSection(False)
+        self.tbl_rank.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.Stretch)
+        self.tbl_rank.verticalHeader().setVisible(False)
+        self.tbl_rank.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.tbl_rank.setMaximumHeight(120)
+        bl.addWidget(self.tbl_rank)
+        hv.addWidget(box)
+
+        box = QtWidgets.QGroupBox("失敗履歴（クリックでスクリーンショット表示）")
+        bl = QtWidgets.QHBoxLayout(box)
+        self.list_failures = QtWidgets.QListWidget()
+        self.list_failures.itemClicked.connect(self.on_failure_selected)
+        bl.addWidget(self.list_failures, 1)
+        self.lbl_fail_preview = QtWidgets.QLabel("失敗履歴をクリックすると\nここに画像が表示されます")
+        self.lbl_fail_preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_fail_preview.setMinimumSize(180, 180)
+        self.lbl_fail_preview.setStyleSheet("background:#222; color:#aaa;")
+        bl.addWidget(self.lbl_fail_preview, 1)
+        hv.addWidget(box, 1)
+
+        tabs.addTab(tab_hist, "確認")
+        self.tabs = tabs
+        tabs.currentChanged.connect(self.on_tab_changed)
+
+        v.addWidget(tabs)
 
         # 停止・状態
         row = QtWidgets.QHBoxLayout()
@@ -473,6 +625,70 @@ class MainWindow(QtWidgets.QWidget):
         self._busy(False)
         if self.cmb_recipe.findText(self.cmb_recipe.currentText()) < 0:
             self.cmb_recipe.addItem(self.cmb_recipe.currentText())
+        self.refresh_history()
+
+    def on_tab_changed(self, index):
+        if self.tabs.tabText(index) == "確認":
+            self.refresh_history()
+
+    def refresh_history(self):
+        name = self.cmb_recipe.currentText().strip()
+        self.list_steps.clear()
+        self.tbl_rank.setRowCount(0)
+        self.list_failures.clear()
+        self.lbl_fail_preview.setPixmap(QtGui.QPixmap())
+        self.lbl_fail_preview.setText("失敗履歴をクリックすると\nここに画像が表示されます")
+        if not name:
+            return
+
+        d = core.recipe_dir(name)
+        recipe_file = d / "recipe.json"
+        if recipe_file.exists():
+            try:
+                data = json.loads(recipe_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                data = {"steps": []}
+                self.append(f"!! レシピの読み込みに失敗: {e}")
+            for i, s in enumerate(data.get("steps", []), 1):
+                item = QtWidgets.QListWidgetItem(f"{i}. {s.get('label', '?')}")
+                ctx = d / f"context_{i:02d}.png"
+                if ctx.exists():
+                    item.setIcon(QtGui.QIcon(str(ctx)))
+                self.list_steps.addItem(item)
+        else:
+            self.list_steps.addItem("(このレシピはまだ記録されていません)")
+
+        failures = core.load_failures(name)
+        counts = {}
+        for f in failures:
+            label = f.get("step_label", "?")
+            counts[label] = counts.get(label, 0) + 1
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+        self.tbl_rank.setRowCount(len(ranked))
+        for row, (label, cnt) in enumerate(ranked):
+            self.tbl_rank.setItem(row, 0, QtWidgets.QTableWidgetItem(label))
+            self.tbl_rank.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{cnt}回"))
+
+        for f in failures[:100]:
+            text = f"{f.get('ts', '?')}  {f.get('step_label', '?')}  {f.get('reason', '')[:30]}"
+            item = QtWidgets.QListWidgetItem(text)
+            item.setData(QtCore.Qt.UserRole, f.get("screenshot"))
+            self.list_failures.addItem(item)
+        if not failures:
+            self.list_failures.addItem("(失敗履歴はまだありません)")
+
+    def on_failure_selected(self, item):
+        fname = item.data(QtCore.Qt.UserRole)
+        name = self.cmb_recipe.currentText().strip()
+        if not fname or not name:
+            return
+        path = core.recipe_dir(name) / fname
+        if not path.exists():
+            self.lbl_fail_preview.setText("画像が見つかりません")
+            return
+        pix = QtGui.QPixmap(str(path))
+        pix = pix.scaledToHeight(240, QtCore.Qt.SmoothTransformation)
+        self.lbl_fail_preview.setPixmap(pix)
 
 
 if __name__ == "__main__":

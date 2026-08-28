@@ -16,6 +16,7 @@ import sys
 import json
 import time
 import shutil
+import datetime
 import subprocess
 import pathlib
 
@@ -206,6 +207,20 @@ def to_gray(pil_img):
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
 
 
+def imwrite(path, img):
+    """
+    cv2.imwrite の代わり。Windows では日本語などを含むパスだと
+    cv2.imwrite はエラーも出さず静かに保存に失敗するため、
+    imencode + ファイル書き込みで代替する。
+    """
+    path = pathlib.Path(path)
+    ok, buf = cv2.imencode(path.suffix or ".png", img)
+    if not ok:
+        return False
+    path.write_bytes(buf.tobytes())
+    return True
+
+
 def crop(pil_img, cx, cy, w, h):
     """(cx, cy) を中心に w×h で切り抜いた PIL 画像を返す"""
     sw, sh = pil_img.size
@@ -257,3 +272,35 @@ def load_recipe(name):
 def list_recipes():
     return sorted(p.name for p in RECIPES.iterdir()
                   if (p / "recipe.json").exists())
+
+
+# --------------------------------------------------------- 失敗履歴の記録
+def append_failure(name, step_label, reason, screenshot):
+    """再生失敗を1件、recipes/<name>/failures.jsonl に追記する"""
+    d = recipe_dir(name)
+    rec = {
+        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "step_label": step_label,
+        "reason": reason,
+        "screenshot": screenshot,
+    }
+    with open(d / "failures.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def load_failures(name):
+    """失敗履歴を新しい順のリストで返す"""
+    path = recipe_dir(name) / "failures.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    out.reverse()
+    return out

@@ -29,9 +29,7 @@ pip install -r requirements.txt
 
 ## 使い方
 
-```bash
-python gui.py
-```
+`dist\TapReplay\TapReplay.exe` をダブルクリックして起動します（未ビルドの場合は先に「exe にする」を参照）。
 
 1. **接続** — USB 接続して「接続」。モデル名と画面サイズが出れば OK
 2. **記録** — レシピ名を入れて「記録開始」。PC に端末画面が出るので、操作したいボタンを実行したい順にクリック → 「保存して閉じる」
@@ -50,7 +48,7 @@ python gui.py
 - **待ち時間が長い手順でタイムアウト** … 「各ステップ最大待ち秒」を上げる
 - **記録中に画面が進まない** … 「クリックを端末にも送る」が ON か確認。反応が遅いアプリは「送信後に画面更新するまで秒」を長めに
 
-## exe にする（配布用）
+## exe にする（初回ビルド／コード変更時）
 
 ```bash
 pip install pyinstaller
@@ -59,13 +57,17 @@ build.bat
 
 `dist/TapReplay/TapReplay.exe` が生成されます。`adb.exe`（platform-tools 一式）を同じフォルダに置くか、PATH を通してください。
 
+コードを変更するたびに `build.bat` を手動実行するのが面倒な場合は、`watch_build.bat` を開いたままにしておくと `core.py` / `gui.py` の保存を検知して自動で再ビルドしてくれます（詳細はウィンドウ内のログを参照）。
+
 ## ファイル構成
 
 | ファイル | 役割 |
 |---|---|
-| `gui.py` | 本体（これを起動） |
+| `gui.py` | 本体のソース（配布・実行は exe 経由。開発時のみ直接編集） |
 | `core.py` | 端末接続・画面クリック記録・画像マッチング |
 | `build.bat` | exe を作るビルドスクリプト |
+| `watch_build.bat` / `watch_build.ps1` | ソース変更を検知して自動で exe を再ビルドする監視スクリプト |
+| `TapReplay.spec` | PyInstaller のビルド設定 |
 | `requirements.txt` | 依存ライブラリ |
 | `recipes/` | 記録したレシピ（自動生成） |
 

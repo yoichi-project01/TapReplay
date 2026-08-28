@@ -10,7 +10,23 @@ Set-Location $root
 function Invoke-Build {
     $ts = Get-Date -Format 'HH:mm:ss'
     Write-Host "`n[$ts] 変更を検知。ビルド開始..." -ForegroundColor Cyan
+
+    # PyInstaller は dist\TapReplay を丸ごと作り直すため、
+    # 記録済みレシピ(recipes\)を退避してビルド後に戻す
+    $recipesDir = Join-Path $root 'dist\TapReplay\recipes'
+    $backupDir = Join-Path $env:TEMP 'TapReplay_recipes_backup'
+    if (Test-Path $recipesDir) {
+        if (Test-Path $backupDir) { Remove-Item $backupDir -Recurse -Force }
+        Move-Item $recipesDir $backupDir
+    }
+
     python -m PyInstaller --noconfirm TapReplay.spec
+
+    if (Test-Path $backupDir) {
+        if (Test-Path $recipesDir) { Remove-Item $recipesDir -Recurse -Force }
+        Move-Item $backupDir $recipesDir
+    }
+
     $ts = Get-Date -Format 'HH:mm:ss'
     if ($LASTEXITCODE -eq 0) {
         Write-Host "[$ts] ビルド完了 → dist\TapReplay\TapReplay.exe を更新しました" -ForegroundColor Green
