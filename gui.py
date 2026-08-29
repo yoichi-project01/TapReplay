@@ -259,10 +259,13 @@ class RecorderDialog(QtWidgets.QDialog):
                       (rx + self.tpl_w // 2, ry + self.tpl_h // 2),
                       (0, 0, 255), 4)
 
+        crop_img = core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h)
+        is_distinctive = core.is_distinctive(core.to_gray(crop_img))
+
         if self.ck_popup_mode.isChecked():
             idx = len(self.popups) + 1
             tpl = f"popup_{idx:02d}.png"
-            core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h).save(self.dir / tpl)
+            crop_img.save(self.dir / tpl)
             core.imwrite(self.dir / f"context_popup_{idx:02d}.png", ctx)
             self.popups.append({"label": f"ポップアップ{idx}", "template": tpl, "x": rx, "y": ry})
             self._history.append("popup")
@@ -270,11 +273,16 @@ class RecorderDialog(QtWidgets.QDialog):
         else:
             idx = len(self.steps) + 1
             tpl = f"step_{idx:02d}.png"
-            core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h).save(self.dir / tpl)
+            crop_img.save(self.dir / tpl)
             core.imwrite(self.dir / f"context_{idx:02d}.png", ctx)
             self.steps.append({"label": f"タップ{idx}", "template": tpl, "x": rx, "y": ry})
             self._history.append("step")
             self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
+        if not is_distinctive:
+            self._msg(
+                "  !! 注意: この画像はほぼ無地で情報量が少ないです。暗転・読み込み画面"
+                "などに誤反応しやすいので、文字や模様が入るよう「切抜き幅／高さ」を"
+                "広げるか、別の場所をクリックし直すことをおすすめします")
         self._refresh_lists()
 
         if self.ck_send.isChecked():
@@ -368,9 +376,12 @@ class PlayerThread(QtCore.QThread):
         self.sig_log.emit(msg)
 
     def _find_best_match(self, gray, candidates):
-        """candidates のうち今の画面に写っているものを探す(一致度が最も高いものを返す)"""
+        """candidates のうち今の画面に写っているものを探す(一致度が最も高いものを返す)。
+        ほぼ無地のテンプレートは暗転画面などに誤検知しやすいため対象から除外する"""
         best = None
         for s in candidates:
+            if not core.is_distinctive(s["_gray"]):
+                continue
             cx, cy, val = core.match(gray, s["_gray"], self.threshold)
             if cx is not None and (best is None or val > best[3]):
                 best = (s, cx, cy, val)

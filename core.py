@@ -207,6 +207,14 @@ def to_gray(pil_img):
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
 
 
+def is_distinctive(gray, min_std=35.0):
+    """テンプレート画像がほぼ無地(情報量が少ない)かどうかを判定する。
+    ほぼ無地の画像は暗転・読み込み画面など無関係な場所にも高い一致度で
+    誤検知しやすいため、"このステップの番が来た時の直接マッチ"以外
+    (別ステップ・共通ポップアップの探索など)には使わない方が安全"""
+    return float(gray.std()) >= min_std
+
+
 def imwrite(path, img):
     """
     cv2.imwrite の代わり。Windows では日本語などを含むパスだと
