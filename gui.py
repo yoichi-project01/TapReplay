@@ -536,16 +536,24 @@ class PlayerThread(QtCore.QThread):
                     ng_streak += 1
                     self.sig_cycle.emit(ok, ng_total)
                     self._log(f"!! ループ {cycle} 失敗: {e}")
-                    safe_reason = "".join(
-                        c if c.isalnum() else "_" for c in str(e))[:40]
-                    fname = f"error_{datetime.datetime.now():%H%M%S}_{safe_reason}.png"
-                    core.imwrite(recipe_dir / fname, core.to_gray(d.screenshot()))
-                    step_label = current_step["label"] if current_step else "?"
-                    core.append_failure(self.name, step_label, str(e), fname)
+                    # 失敗の記録自体が失敗しても(端末との接続切れ等)再生は止めない
+                    try:
+                        safe_reason = "".join(
+                            c if c.isalnum() else "_" for c in str(e))[:40]
+                        fname = f"error_{datetime.datetime.now():%H%M%S}_{safe_reason}.png"
+                        core.imwrite(recipe_dir / fname, core.to_gray(d.screenshot()))
+                        step_label = current_step["label"] if current_step else "?"
+                        core.append_failure(self.name, step_label, str(e), fname)
+                    except Exception as e2:
+                        self._log(f"!! 失敗時のスクリーンショット保存に失敗: {e2}")
                     if ng_streak >= self.max_fail:
                         self._log(f"!! 失敗が{ng_streak}回連続したため停止します")
                         break
-                    d.press("back")
+                    # back操作自体が失敗しても(接続切れ等)スレッドを落とさず次周へ進む
+                    try:
+                        d.press("back")
+                    except Exception as e2:
+                        self._log(f"!! 端末との通信に失敗しました(接続切れの可能性): {e2}")
                     time.sleep(3)
                 time.sleep(1)
 
