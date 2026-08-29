@@ -266,6 +266,12 @@ def load_recipe(name):
         if g is None:
             raise FileNotFoundError(f"テンプレートが読めません: {step['template']}")
         step["_gray"] = g
+    data.setdefault("popups", [])
+    for popup in data["popups"]:
+        g = cv2.imread(str(d / popup["template"]), cv2.IMREAD_GRAYSCALE)
+        if g is None:
+            raise FileNotFoundError(f"ポップアップのテンプレートが読めません: {popup['template']}")
+        popup["_gray"] = g
     return data
 
 

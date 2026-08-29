@@ -62,6 +62,8 @@ class RecorderDialog(QtWidgets.QDialog):
         self.sw, self.sh = self.d.window_size()
         self.dir = core.recipe_dir(name)
         self.steps = []
+        self.popups = []
+        self._history = []  # 記録順の "step"/"popup" 履歴(一つ戻す用)
         self.pil = None
         self.scale = 1.0
 
@@ -101,19 +103,29 @@ class RecorderDialog(QtWidgets.QDialog):
 
         side.addWidget(QtWidgets.QLabel("記録したステップ（ダブルクリックで名前変更）"))
         self.list_steps_edit = QtWidgets.QListWidget()
-        self.list_steps_edit.setMaximumHeight(140)
+        self.list_steps_edit.setMaximumHeight(120)
         self.list_steps_edit.itemChanged.connect(self.on_step_label_edited)
         side.addWidget(self.list_steps_edit)
+
+        self.ck_popup_mode = QtWidgets.QCheckBox(
+            "共通ポップアップとして記録\n(広告や「フレンド申請」等、順序を問わず割り込んだら閉じる用)")
+        side.addWidget(self.ck_popup_mode)
+
+        side.addWidget(QtWidgets.QLabel("共通ポップアップ一覧（ダブルクリックで名前変更）"))
+        self.list_popups_edit = QtWidgets.QListWidget()
+        self.list_popups_edit.setMaximumHeight(90)
+        self.list_popups_edit.itemChanged.connect(self.on_popup_label_edited)
+        side.addWidget(self.list_popups_edit)
 
         self.log = QtWidgets.QPlainTextEdit(); self.log.setReadOnly(True)
         side.addWidget(self.log, 1)
         root.addLayout(side)
 
         self._load_existing()
-        self._refresh_step_list()
+        self._refresh_lists()
         self.refresh()
 
-    def _refresh_step_list(self):
+    def _refresh_lists(self):
         self.list_steps_edit.blockSignals(True)
         self.list_steps_edit.clear()
         for s in self.steps:
@@ -121,6 +133,14 @@ class RecorderDialog(QtWidgets.QDialog):
             item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
             self.list_steps_edit.addItem(item)
         self.list_steps_edit.blockSignals(False)
+
+        self.list_popups_edit.blockSignals(True)
+        self.list_popups_edit.clear()
+        for p in self.popups:
+            item = QtWidgets.QListWidgetItem(p["label"])
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+            self.list_popups_edit.addItem(item)
+        self.list_popups_edit.blockSignals(False)
 
     def on_step_label_edited(self, item):
         idx = self.list_steps_edit.row(item)
@@ -133,6 +153,17 @@ class RecorderDialog(QtWidgets.QDialog):
         else:
             item.setText(self.steps[idx]["label"])  # 空にはできない
 
+    def on_popup_label_edited(self, item):
+        idx = self.list_popups_edit.row(item)
+        if not (0 <= idx < len(self.popups)):
+            return
+        new_label = item.text().strip()
+        if new_label:
+            self.popups[idx]["label"] = new_label
+            self._msg(f"popup{idx + 1} の名前を「{new_label}」に変更しました")
+        else:
+            item.setText(self.popups[idx]["label"])  # 空にはできない
+
     def _load_existing(self):
         """同名レシピが既にあれば、続きから記録するか確認して読み込む"""
         recipe_file = self.dir / "recipe.json"
@@ -144,12 +175,14 @@ class RecorderDialog(QtWidgets.QDialog):
             self._msg(f"!! 既存レシピの読み込みに失敗: {e}")
             return
         prev_steps = data.get("steps", [])
-        if not prev_steps:
+        prev_popups = data.get("popups", [])
+        if not prev_steps and not prev_popups:
             return
 
         resp = QtWidgets.QMessageBox.question(
             self, "既存レシピが見つかりました",
-            f"「{self.name}」には既に{len(prev_steps)}ステップ記録されています。\n\n"
+            f"「{self.name}」には既に{len(prev_steps)}ステップ"
+            f"・{len(prev_popups)}件の共通ポップアップが記録されています。\n\n"
             "「はい」: プログラムが止まった続きから追加記録する\n"
             "「いいえ」: 最初からやり直す（既存の記録は削除されます）",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
@@ -157,18 +190,24 @@ class RecorderDialog(QtWidgets.QDialog):
         )
         if resp == QtWidgets.QMessageBox.Yes:
             self.steps = prev_steps
-            self._msg(f"続きから記録します（{len(prev_steps)}ステップ目まで読み込み済み）")
+            self.popups = prev_popups
+            self._history = ["step"] * len(self.steps) + ["popup"] * len(self.popups)
+            self._msg(
+                f"続きから記録します（ステップ{len(prev_steps)}件・"
+                f"共通ポップアップ{len(prev_popups)}件を読み込み済み）")
             dev_size = data.get("device_size")
             if dev_size and list(dev_size) != [self.sw, self.sh]:
                 self._msg(
                     f"!! 注意: 記録時({dev_size})と今の画面サイズ"
                     f"({self.sw},{self.sh})が違います")
         else:
-            for f in list(self.dir.glob("step_*.png")) + list(self.dir.glob("context_*.png")):
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+            for pattern in ("step_*.png", "context_*.png",
+                             "popup_*.png", "context_popup_*.png"):
+                for f in self.dir.glob(pattern):
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
             self._msg("既存の記録を削除し、最初から記録します")
 
     def _msg(self, m):
@@ -187,15 +226,21 @@ class RecorderDialog(QtWidgets.QDialog):
         disp = self.pil.resize(
             (int(self.sw * self.scale), int(self.sh * self.scale)))
         pix = pil_to_qpix(disp)
-        # 記録済みの位置に番号入りマーカーを描く
+        # 記録済みの位置に番号入りマーカーを描く(ステップ=赤, ポップアップ=青)
         painter = QtGui.QPainter(pix)
+        painter.setFont(QtGui.QFont("Arial", 14, QtGui.QFont.Bold))
         pen = QtGui.QPen(QtGui.QColor(255, 0, 0)); pen.setWidth(3)
         painter.setPen(pen)
-        painter.setFont(QtGui.QFont("Arial", 14, QtGui.QFont.Bold))
         for i, s in enumerate(self.steps, 1):
             x = int(s["x"] * self.scale); y = int(s["y"] * self.scale)
             painter.drawEllipse(QtCore.QPoint(x, y), 14, 14)
             painter.drawText(x + 16, y + 6, str(i))
+        pen = QtGui.QPen(QtGui.QColor(60, 140, 255)); pen.setWidth(3)
+        painter.setPen(pen)
+        for i, p in enumerate(self.popups, 1):
+            x = int(p["x"] * self.scale); y = int(p["y"] * self.scale)
+            painter.drawEllipse(QtCore.QPoint(x, y), 14, 14)
+            painter.drawText(x + 16, y + 6, f"P{i}")
         painter.end()
         self.img.setPixmap(pix)
         self.img.setFixedSize(pix.size())
@@ -207,18 +252,29 @@ class RecorderDialog(QtWidgets.QDialog):
             return
         rx = int(lx / self.scale)
         ry = int(ly / self.scale)
-        idx = len(self.steps) + 1
-        tpl = f"step_{idx:02d}.png"
-        core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h).save(self.dir / tpl)
         ctx = cv2.cvtColor(np.array(self.pil), cv2.COLOR_RGB2BGR)
         cv2.rectangle(ctx,
                       (rx - self.tpl_w // 2, ry - self.tpl_h // 2),
                       (rx + self.tpl_w // 2, ry + self.tpl_h // 2),
                       (0, 0, 255), 4)
-        core.imwrite(self.dir / f"context_{idx:02d}.png", ctx)
-        self.steps.append({"label": f"タップ{idx}", "template": tpl, "x": rx, "y": ry})
-        self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
-        self._refresh_step_list()
+
+        if self.ck_popup_mode.isChecked():
+            idx = len(self.popups) + 1
+            tpl = f"popup_{idx:02d}.png"
+            core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h).save(self.dir / tpl)
+            core.imwrite(self.dir / f"context_popup_{idx:02d}.png", ctx)
+            self.popups.append({"label": f"ポップアップ{idx}", "template": tpl, "x": rx, "y": ry})
+            self._history.append("popup")
+            self._msg(f"popup{idx}: ({rx},{ry}) → {tpl} (共通ポップアップとして記録)")
+        else:
+            idx = len(self.steps) + 1
+            tpl = f"step_{idx:02d}.png"
+            core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h).save(self.dir / tpl)
+            core.imwrite(self.dir / f"context_{idx:02d}.png", ctx)
+            self.steps.append({"label": f"タップ{idx}", "template": tpl, "x": rx, "y": ry})
+            self._history.append("step")
+            self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
+        self._refresh_lists()
 
         if self.ck_send.isChecked():
             try:
@@ -234,17 +290,26 @@ class RecorderDialog(QtWidgets.QDialog):
             self.refresh()
 
     def undo(self):
-        if not self.steps:
+        if not self._history:
             return
-        s = self.steps.pop()
-        idx = len(self.steps) + 1
-        for f in (self.dir / s["template"], self.dir / f"context_{idx:02d}.png"):
+        kind = self._history.pop()
+        if kind == "popup":
+            s = self.popups.pop()
+            idx = len(self.popups) + 1
+            ctx_name = f"context_popup_{idx:02d}.png"
+            label = f"popup{idx}"
+        else:
+            s = self.steps.pop()
+            idx = len(self.steps) + 1
+            ctx_name = f"context_{idx:02d}.png"
+            label = f"step{idx}"
+        for f in (self.dir / s["template"], self.dir / ctx_name):
             try:
                 f.unlink()
             except Exception:
                 pass
-        self._msg(f"step{idx} を取り消しました")
-        self._refresh_step_list()
+        self._msg(f"{label} を取り消しました")
+        self._refresh_lists()
         self.refresh()
 
     def save(self):
@@ -253,9 +318,12 @@ class RecorderDialog(QtWidgets.QDialog):
             return
         core.save_recipe(self.name, {
             "device_size": [self.sw, self.sh],
+            "popups": self.popups,
             "steps": self.steps,
         })
-        self._msg(f"保存しました: recipes/{self.name}/ ({len(self.steps)}ステップ)")
+        self._msg(
+            f"保存しました: recipes/{self.name}/ "
+            f"({len(self.steps)}ステップ・共通ポップアップ{len(self.popups)}件)")
         self.accept()
 
 
@@ -298,18 +366,31 @@ class PlayerThread(QtCore.QThread):
                 pass
         self.sig_log.emit(msg)
 
-    def _find_later_match(self, gray, later_steps):
-        """現在待っている画像がまだ見つからないとき、レシピ内の"これより後の"
-        ステップ画像が今の画面に写っていないか探す（想定外のポップアップ等からの復帰用）。
-        既に完了した前のステップは対象にしない(誤って前の操作を踏み直さないため)"""
+    def _find_best_match(self, gray, candidates):
+        """candidates のうち今の画面に写っているものを探す(一致度が最も高いものを返す)"""
         best = None
-        for s in later_steps:
+        for s in candidates:
             cx, cy, val = core.match(gray, s["_gray"], self.threshold)
             if cx is not None and (best is None or val > best[3]):
                 best = (s, cx, cy, val)
         return best
 
-    def _wait_and_tap(self, d, step, later_steps):
+    def _dismiss_popup_if_any(self, gray, popups):
+        """共通ポップアップ(広告・フレンド申請等)が写っていれば閉じる。閉じたらTrue"""
+        import random
+        hit = self._find_best_match(gray, popups)
+        if hit is None:
+            return False
+        popup, pcx, pcy, pval = hit
+        jx = pcx + random.randint(-self.jitter, self.jitter)
+        jy = pcy + random.randint(-self.jitter, self.jitter)
+        core.tap(self._serial, jx, jy, self.hold_ms)
+        self._log(
+            f"    !! 共通ポップアップ「{popup['label']}」を検知(一致{pval:.2f})したので閉じました")
+        time.sleep(self.after)
+        return True
+
+    def _wait_and_tap(self, d, step, later_steps, popups):
         import random
         deadline = time.time() + self.step_timeout
         best = 0.0
@@ -318,6 +399,12 @@ class PlayerThread(QtCore.QThread):
             if self._stop:
                 raise KeyboardInterrupt
             gray = core.to_gray(d.screenshot())
+
+            # 共通ポップアップは、対象ステップの探索より先に毎回チェックする
+            # (どのステップを待っていても、順序に関係なく割り込んで閉じる)
+            if self._dismiss_popup_if_any(gray, popups):
+                continue
+
             cx, cy, val = core.match(gray, step["_gray"], self.threshold)
             best = max(best, val)
 
@@ -325,6 +412,7 @@ class PlayerThread(QtCore.QThread):
                 # 見つかった → タップ。効かなければ押し直す。
                 # 成功判定は「押したボタンが画面から消えたか」で見る
                 # （背景アニメに惑わされない）
+                popup_interrupted = False
                 for attempt in range(1, self.tap_retry + 1):
                     jx = cx + random.randint(-self.jitter, self.jitter)
                     jy = cy + random.randint(-self.jitter, self.jitter)
@@ -336,6 +424,11 @@ class PlayerThread(QtCore.QThread):
                     if not self.verify:
                         return
                     after_gray = core.to_gray(d.screenshot())
+                    # ボタンが消えずに残っているように見えても、実は共通ポップアップに
+                    # 覆われていて反応していないだけ、というケースがあるため先に確認する
+                    if self._dismiss_popup_if_any(after_gray, popups):
+                        popup_interrupted = True
+                        break
                     ncx, ncy, nval = core.match(after_gray, step["_gray"], self.threshold)
                     if ncx is None:
                         return  # ボタンが消えた＝タップ成功、次へ
@@ -343,6 +436,8 @@ class PlayerThread(QtCore.QThread):
                     cx, cy = ncx, ncy
                     self._log(
                         f"    …まだボタンが残っています(一致{nval:.2f})。押し直します")
+                if popup_interrupted:
+                    continue  # ポップアップを閉じたので対象を探し直す
                 self._log(
                     f"    !! {step['label']}: 押しても反応しません。"
                     "「タップ長押しms」を80〜150に上げてみてください")
@@ -353,7 +448,7 @@ class PlayerThread(QtCore.QThread):
             # 対象の画像が見つからない → 想定外の画面(広告・確認ダイアログ等)の
             # 可能性があるので、レシピ内の"これより後の"ステップ画像が
             # 写っていないか探す(前のステップは対象にしない)
-            other = self._find_later_match(gray, later_steps)
+            other = self._find_best_match(gray, later_steps)
             if other is not None:
                 other_step, ocx, ocy, oval = other
                 jx = ocx + random.randint(-self.jitter, self.jitter)
@@ -400,7 +495,9 @@ class PlayerThread(QtCore.QThread):
                     f"!! 注意: 記録時({data['device_size']})と画面サイズが違います。"
                     "解像度・向きを合わせてください"
                 )
-            self._log(f"再生開始: {len(data['steps'])}ステップ / "
+            popups = data.get("popups", [])
+            self._log(f"再生開始: {len(data['steps'])}ステップ"
+                      f"（共通ポップアップ{len(popups)}件） / "
                       f"{'無限' if self.loops == 0 else self.loops}周")
 
             ok = ng_total = ng_streak = cycle = 0
@@ -414,7 +511,7 @@ class PlayerThread(QtCore.QThread):
                 try:
                     for idx, step in enumerate(data["steps"]):
                         current_step = step
-                        self._wait_and_tap(d, step, data["steps"][idx + 1:])
+                        self._wait_and_tap(d, step, data["steps"][idx + 1:], popups)
                     ok += 1
                     ng_streak = 0  # 連続失敗カウントは成功したらリセット
                     self.sig_cycle.emit(ok, ng_total)
@@ -551,6 +648,14 @@ class MainWindow(QtWidgets.QWidget):
         self.list_steps.setIconSize(QtCore.QSize(64, 64))
         self.list_steps.setMaximumHeight(160)
         bl.addWidget(self.list_steps)
+        hv.addWidget(box)
+
+        box = QtWidgets.QGroupBox("共通ポップアップ（順序を問わず割り込みを閉じる）")
+        bl = QtWidgets.QVBoxLayout(box)
+        self.list_popups = QtWidgets.QListWidget()
+        self.list_popups.setIconSize(QtCore.QSize(64, 64))
+        self.list_popups.setMaximumHeight(100)
+        bl.addWidget(self.list_popups)
         hv.addWidget(box)
 
         box = QtWidgets.QGroupBox("よく止まる箇所（失敗回数の多い順）")
@@ -717,6 +822,7 @@ class MainWindow(QtWidgets.QWidget):
     def refresh_history(self):
         name = self.cmb_recipe.currentText().strip()
         self.list_steps.clear()
+        self.list_popups.clear()
         self.tbl_rank.setRowCount(0)
         self.list_failures.clear()
         self.lbl_fail_preview.setPixmap(QtGui.QPixmap())
@@ -732,17 +838,26 @@ class MainWindow(QtWidgets.QWidget):
             except Exception as e:
                 data = {"steps": []}
                 self.append(f"!! レシピの読み込みに失敗: {e}")
-            for i, s in enumerate(data.get("steps", []), 1):
-                item = QtWidgets.QListWidgetItem(f"{i}. {s.get('label', '?')}")
-                ctx = d / f"context_{i:02d}.png"
-                if ctx.exists():
+
+            def add_thumb_item(list_widget, label, ctx_path):
+                item = QtWidgets.QListWidgetItem(label)
+                if ctx_path.exists():
                     # フルサイズ画像をそのままQIconにすると重いので縮小してから使う
-                    pix = QtGui.QPixmap(str(ctx))
+                    pix = QtGui.QPixmap(str(ctx_path))
                     if not pix.isNull():
                         pix = pix.scaled(64, 64, QtCore.Qt.KeepAspectRatio,
                                           QtCore.Qt.SmoothTransformation)
                         item.setIcon(QtGui.QIcon(pix))
-                self.list_steps.addItem(item)
+                list_widget.addItem(item)
+
+            for i, s in enumerate(data.get("steps", []), 1):
+                add_thumb_item(self.list_steps, f"{i}. {s.get('label', '?')}",
+                               d / f"context_{i:02d}.png")
+            for i, p in enumerate(data.get("popups", []), 1):
+                add_thumb_item(self.list_popups, f"P{i}. {p.get('label', '?')}",
+                               d / f"context_popup_{i:02d}.png")
+            if not data.get("popups"):
+                self.list_popups.addItem("(共通ポップアップは未登録です)")
         else:
             self.list_steps.addItem("(このレシピはまだ記録されていません)")
 
