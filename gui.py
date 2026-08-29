@@ -18,6 +18,7 @@ Android 端末の画面操作を記録し、あとから再生する汎用ツー
 import io
 import json
 import time
+import shutil
 import datetime
 
 import cv2
@@ -642,6 +643,11 @@ class MainWindow(QtWidgets.QWidget):
         hist_btn_row.addWidget(btn_clear_hist)
         hv.addLayout(hist_btn_row)
 
+        btn_delete_recipe = QtWidgets.QPushButton("このレシピを削除する")
+        btn_delete_recipe.setStyleSheet("color: #b00000;")
+        btn_delete_recipe.clicked.connect(self.on_delete_recipe)
+        hv.addWidget(btn_delete_recipe)
+
         box = QtWidgets.QGroupBox("記録したステップ")
         bl = QtWidgets.QVBoxLayout(box)
         self.list_steps = QtWidgets.QListWidget()
@@ -817,6 +823,47 @@ class MainWindow(QtWidgets.QWidget):
             except Exception as e:
                 self.append(f"!! 削除失敗: {f.name} ({e})")
         self.append(f"「{name}」の失敗履歴・ログを{removed}件消去しました")
+        self.refresh_history()
+
+    def on_delete_recipe(self):
+        name = self.cmb_recipe.currentText().strip()
+        if not name:
+            self.append("!! レシピ名を入れてください")
+            return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
+        if self.worker is not None and self.worker.isRunning() and self.worker.name == name:
+            self.append(f"!! 「{name}」は再生中のため削除できません。先に停止してください")
+            return
+        d = core.recipe_dir(name)
+        if not (d / "recipe.json").exists():
+            self.append(f"「{name}」はまだ記録されていません")
+            try:
+                d.rmdir()  # recipe_dir()が作った空フォルダなら片付ける
+            except OSError:
+                pass
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self, "レシピを削除",
+            f"「{name}」を完全に削除します。\n"
+            "記録したステップ画像・共通ポップアップ・失敗履歴・ログもすべて削除され、"
+            "元に戻せません。\n\n本当に削除しますか？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            shutil.rmtree(d)
+        except Exception as e:
+            self.append(f"!! 削除に失敗しました: {e}")
+            return
+        self.append(f"「{name}」を削除しました")
+        idx = self.cmb_recipe.findText(name)
+        if idx >= 0:
+            self.cmb_recipe.removeItem(idx)
+        self.cmb_recipe.setCurrentText("")
         self.refresh_history()
 
     def refresh_history(self):
