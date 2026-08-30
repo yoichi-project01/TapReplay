@@ -194,12 +194,15 @@ class RecorderDialog(QtWidgets.QDialog):
             side.addWidget(with_help(b, tip))
 
         side.addWidget(help_label(
-            "記録したステップ（ダブルクリックで名前変更）",
+            "記録したステップ（ダブルクリックで名前変更／ドラッグで順番変更）",
             "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。"
-            "項目をダブルクリックすると「タップ1」のような名前を自由に変更できます。"))
+            "項目をダブルクリックすると「タップ1」のような名前を自由に変更でき、"
+            "ドラッグ＆ドロップで実行順を入れ替えられます。"))
         self.list_steps_edit = QtWidgets.QListWidget()
         self.list_steps_edit.setMaximumHeight(120)
+        self.list_steps_edit.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
         self.list_steps_edit.itemChanged.connect(self.on_step_label_edited)
+        self.list_steps_edit.model().rowsMoved.connect(self.on_steps_reordered)
         side.addWidget(self.list_steps_edit)
 
         self.ck_popup_mode = QtWidgets.QCheckBox(
@@ -234,6 +237,7 @@ class RecorderDialog(QtWidgets.QDialog):
         for s in self.steps:
             item = QtWidgets.QListWidgetItem(s["label"])
             item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+            item.setData(QtCore.Qt.UserRole, s)
             self.list_steps_edit.addItem(item)
         self.list_steps_edit.blockSignals(False)
 
@@ -244,6 +248,18 @@ class RecorderDialog(QtWidgets.QDialog):
             item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
             self.list_popups_edit.addItem(item)
         self.list_popups_edit.blockSignals(False)
+
+    def on_steps_reordered(self, *args):
+        """ドラッグ＆ドロップで並び替えた後、self.stepsの順番も同期する。
+        リスト自体はInternalMoveで既に正しい見た目になっているので、
+        ここではPython側のデータだけ同期する(移動中にリストを作り直すと
+        Qtの内部状態と衝突する恐れがあるため、clear/再構築はしない)"""
+        self.steps = [
+            self.list_steps_edit.item(i).data(QtCore.Qt.UserRole)
+            for i in range(self.list_steps_edit.count())
+        ]
+        self._msg("ステップの順番を変更しました")
+        self.refresh()
 
     def on_step_label_edited(self, item):
         idx = self.list_steps_edit.row(item)
@@ -294,7 +310,8 @@ class RecorderDialog(QtWidgets.QDialog):
         if resp == QtWidgets.QMessageBox.Yes:
             self.steps = prev_steps
             self.popups = prev_popups
-            self._history = ["step"] * len(self.steps) + ["popup"] * len(self.popups)
+            self._history = ([("step", s) for s in self.steps] +
+                              [("popup", p) for p in self.popups])
             self._msg(
                 f"続きから記録します（ステップ{len(prev_steps)}件・"
                 f"共通ポップアップ{len(prev_popups)}件を読み込み済み）")
@@ -367,18 +384,24 @@ class RecorderDialog(QtWidgets.QDialog):
         if self.ck_popup_mode.isChecked():
             idx = len(self.popups) + 1
             tpl = f"popup_{idx:02d}.png"
+            ctx_name = f"context_popup_{idx:02d}.png"
             crop_img.save(self.dir / tpl)
-            core.imwrite(self.dir / f"context_popup_{idx:02d}.png", ctx)
-            self.popups.append({"label": f"ポップアップ{idx}", "template": tpl, "x": rx, "y": ry})
-            self._history.append("popup")
+            core.imwrite(self.dir / ctx_name, ctx)
+            new_item = {"label": f"ポップアップ{idx}", "template": tpl,
+                        "context": ctx_name, "x": rx, "y": ry}
+            self.popups.append(new_item)
+            self._history.append(("popup", new_item))
             self._msg(f"popup{idx}: ({rx},{ry}) → {tpl} (共通ポップアップとして記録)")
         else:
             idx = len(self.steps) + 1
             tpl = f"step_{idx:02d}.png"
+            ctx_name = f"context_{idx:02d}.png"
             crop_img.save(self.dir / tpl)
-            core.imwrite(self.dir / f"context_{idx:02d}.png", ctx)
-            self.steps.append({"label": f"タップ{idx}", "template": tpl, "x": rx, "y": ry})
-            self._history.append("step")
+            core.imwrite(self.dir / ctx_name, ctx)
+            new_item = {"label": f"タップ{idx}", "template": tpl,
+                        "context": ctx_name, "x": rx, "y": ry}
+            self.steps.append(new_item)
+            self._history.append(("step", new_item))
             self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
         if not is_distinctive:
             self._msg(
@@ -403,23 +426,20 @@ class RecorderDialog(QtWidgets.QDialog):
     def undo(self):
         if not self._history:
             return
-        kind = self._history.pop()
-        if kind == "popup":
-            s = self.popups.pop()
-            idx = len(self.popups) + 1
-            ctx_name = f"context_popup_{idx:02d}.png"
-            label = f"popup{idx}"
-        else:
-            s = self.steps.pop()
-            idx = len(self.steps) + 1
-            ctx_name = f"context_{idx:02d}.png"
-            label = f"step{idx}"
-        for f in (self.dir / s["template"], self.dir / ctx_name):
-            try:
-                f.unlink()
-            except Exception:
-                pass
-        self._msg(f"{label} を取り消しました")
+        kind, obj = self._history.pop()
+        # 並び替え後でも安全なように、位置(pop)ではなく対象そのものを取り除く
+        target_list = self.popups if kind == "popup" else self.steps
+        try:
+            target_list.remove(obj)
+        except ValueError:
+            pass  # 既に別の操作で消えている場合は何もしない
+        for fname in (obj.get("template"), obj.get("context")):
+            if fname:
+                try:
+                    (self.dir / fname).unlink()
+                except Exception:
+                    pass
+        self._msg(f"「{obj['label']}」を取り消しました")
         self._refresh_lists()
         self.refresh()
 
