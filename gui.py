@@ -791,28 +791,20 @@ class MainWindow(QtWidgets.QWidget):
         pv.addStretch(1)
         tabs.addTab(tab_play, "再生")
 
-        # --- 確認タブ（記録内容・よく止まる箇所） ---
-        tab_hist = QtWidgets.QWidget()
-        hv = QtWidgets.QVBoxLayout(tab_hist)
+        # --- 記録内容タブ ---
+        tab_content = QtWidgets.QWidget()
+        cv = QtWidgets.QVBoxLayout(tab_content)
 
-        hist_btn_row = QtWidgets.QHBoxLayout()
-        btn_refresh_hist = QtWidgets.QPushButton("表示を更新（上のレシピ名を対象）")
-        btn_refresh_hist.clicked.connect(self.refresh_history)
-        hist_btn_row.addWidget(with_help(
-            btn_refresh_hist,
-            "上のレシピ名で記録した内容や失敗の履歴を、この画面に読み込み直します。"), 1)
-        btn_clear_hist = QtWidgets.QPushButton("失敗履歴・ログを消去")
-        btn_clear_hist.clicked.connect(self.on_clear_history)
-        hist_btn_row.addWidget(with_help(
-            btn_clear_hist,
-            "このレシピの失敗スクリーンショット・再生ログ・失敗履歴のみを"
-            "削除します。記録したステップ画像や共通ポップアップは残ります。"))
-        hv.addLayout(hist_btn_row)
+        btn_refresh_content = QtWidgets.QPushButton("表示を更新（上のレシピ名を対象）")
+        btn_refresh_content.clicked.connect(self.refresh_history)
+        cv.addWidget(with_help(
+            btn_refresh_content,
+            "上のレシピ名で記録した内容を、この画面に読み込み直します。"))
 
         btn_delete_recipe = QtWidgets.QPushButton("このレシピを削除する")
         btn_delete_recipe.setStyleSheet("color: #b00000;")
         btn_delete_recipe.clicked.connect(self.on_delete_recipe)
-        hv.addWidget(with_help(
+        cv.addWidget(with_help(
             btn_delete_recipe,
             "レシピをフォルダごと完全に削除します。記録したステップ画像・"
             "共通ポップアップ・失敗履歴もすべて消え、元に戻せません。"))
@@ -821,23 +813,40 @@ class MainWindow(QtWidgets.QWidget):
         bl = QtWidgets.QVBoxLayout(box)
         self.list_steps = QtWidgets.QListWidget()
         self.list_steps.setIconSize(QtCore.QSize(64, 64))
-        self.list_steps.setMaximumHeight(160)
-        bl.addWidget(self.list_steps)
-        hv.addLayout(groupbox_help(
+        cv.addLayout(groupbox_help(
             "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。"))
-        hv.addWidget(box)
+        bl.addWidget(self.list_steps)
+        cv.addWidget(box, 1)
 
         box = QtWidgets.QGroupBox("共通ポップアップ（順序を問わず割り込みを閉じる）")
         bl = QtWidgets.QVBoxLayout(box)
         self.list_popups = QtWidgets.QListWidget()
         self.list_popups.setIconSize(QtCore.QSize(64, 64))
-        self.list_popups.setMaximumHeight(100)
-        bl.addWidget(self.list_popups)
-        hv.addLayout(groupbox_help(
+        cv.addLayout(groupbox_help(
             "広告や「フレンド申請」など、どのステップの最中でも突然現れる"
             "可能性がある画面を登録する場所です。再生中はステップの実行順序に"
             "関係なく、これらの画像が見えたら優先して閉じてから元の操作を続けます。"))
-        hv.addWidget(box)
+        bl.addWidget(self.list_popups)
+        cv.addWidget(box, 1)
+
+        tabs.addTab(tab_content, "記録内容")
+
+        # --- 失敗履歴タブ ---
+        tab_fail = QtWidgets.QWidget()
+        fv = QtWidgets.QVBoxLayout(tab_fail)
+
+        btn_refresh_fail = QtWidgets.QPushButton("表示を更新（上のレシピ名を対象）")
+        btn_refresh_fail.clicked.connect(self.refresh_history)
+        fv.addWidget(with_help(
+            btn_refresh_fail,
+            "上のレシピ名で失敗の履歴を、この画面に読み込み直します。"))
+
+        btn_clear_hist = QtWidgets.QPushButton("失敗履歴・ログを消去")
+        btn_clear_hist.clicked.connect(self.on_clear_history)
+        fv.addWidget(with_help(
+            btn_clear_hist,
+            "このレシピの失敗スクリーンショット・再生ログ・失敗履歴のみを"
+            "削除します。記録したステップ画像や共通ポップアップは残ります。"))
 
         box = QtWidgets.QGroupBox("よく止まる箇所（失敗回数の多い順）")
         bl = QtWidgets.QVBoxLayout(box)
@@ -850,11 +859,11 @@ class MainWindow(QtWidgets.QWidget):
         self.tbl_rank.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.tbl_rank.setMaximumHeight(120)
         bl.addWidget(self.tbl_rank)
-        hv.addLayout(groupbox_help(
+        fv.addLayout(groupbox_help(
             "過去の再生でどのステップが何回失敗したかを、失敗回数の多い順に"
             "表示します。よく失敗するステップは、しきい値や切り抜き画像を"
             "見直す目安になります。"))
-        hv.addWidget(box)
+        fv.addWidget(box)
 
         box = QtWidgets.QGroupBox("失敗履歴（クリックでスクリーンショット表示）")
         bl = QtWidgets.QHBoxLayout(box)
@@ -866,12 +875,13 @@ class MainWindow(QtWidgets.QWidget):
         self.lbl_fail_preview.setMinimumSize(180, 180)
         self.lbl_fail_preview.setStyleSheet("background:#222; color:#aaa;")
         bl.addWidget(self.lbl_fail_preview, 1)
-        hv.addLayout(groupbox_help(
+        fv.addLayout(groupbox_help(
             "過去に失敗した日時・ステップ・理由の一覧です。クリックすると、"
             "その時の端末画面のスクリーンショットを右側に表示します。"))
-        hv.addWidget(box, 1)
+        fv.addWidget(box, 1)
 
-        tabs.addTab(tab_hist, "確認")
+        tabs.addTab(tab_fail, "失敗履歴")
+
         self.tabs = tabs
         tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -973,7 +983,7 @@ class MainWindow(QtWidgets.QWidget):
         self.refresh_history()
 
     def on_tab_changed(self, index):
-        if self.tabs.tabText(index) == "確認":
+        if self.tabs.tabText(index) in ("記録内容", "失敗履歴"):
             self.refresh_history()
 
     def on_clear_history(self):
