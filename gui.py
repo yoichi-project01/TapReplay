@@ -42,6 +42,27 @@ def pil_to_qpix(pil_img):
     return QtGui.QPixmap.fromImage(qimg)
 
 
+def help_label(text, tip):
+    """設定名などのラベルに「?」マークを付け、カーソルを合わせると
+    使い方が表示されるようにする"""
+    lbl = QtWidgets.QLabel(f"{text} ❓")
+    lbl.setToolTip(tip)
+    lbl.setCursor(QtCore.Qt.WhatsThisCursor)
+    return lbl
+
+
+def with_help(widget, tip):
+    """ボタン・チェックボックス・グループボックスの表示テキストに「?」マークを
+    付け足し、ホバーで使い方が表示されるようにする"""
+    if hasattr(widget, "setTitle"):
+        widget.setTitle(f"{widget.title()} ❓")
+    else:
+        widget.setText(f"{widget.text()} ❓")
+    widget.setToolTip(tip)
+    widget.setCursor(QtCore.Qt.WhatsThisCursor)
+    return widget
+
+
 # ============================================ クリックできる画像ラベル
 class ClickableLabel(QtWidgets.QLabel):
     clicked = QtCore.Signal(int, int)
@@ -80,39 +101,61 @@ class RecorderDialog(QtWidgets.QDialog):
         side = QtWidgets.QVBoxLayout()
         side.addWidget(QtWidgets.QLabel(
             "画面の上で、操作したいボタンを\n実行したい順にクリック"))
-        self.ck_send = QtWidgets.QCheckBox("クリックを端末にも送る(画面を進める)")
+        self.ck_send = with_help(
+            QtWidgets.QCheckBox("クリックを端末にも送る(画面を進める)"),
+            "ONにすると、記録のためにクリックした位置に実際のタップも端末へ送信し、"
+            "画面を先に進めます。OFFにすると記録だけ行うので、端末の画面は"
+            "自分の手で操作して進める必要があります。")
         self.ck_send.setChecked(True)
         side.addWidget(self.ck_send)
 
         self.sp_delay = QtWidgets.QDoubleSpinBox()
         self.sp_delay.setRange(0.3, 10); self.sp_delay.setValue(1.5)
         drow = QtWidgets.QHBoxLayout()
-        drow.addWidget(QtWidgets.QLabel("送信後に画面更新するまで秒"))
+        drow.addWidget(help_label(
+            "送信後に画面更新するまで秒",
+            "端末にタップを送信してから、次のクリックを受け付けるまでの待ち時間(秒)。"
+            "画面の反応が遅いアプリでは長めにしてください。"))
         drow.addWidget(self.sp_delay)
         side.addLayout(drow)
 
-        b_refresh = QtWidgets.QPushButton("画面更新")
+        b_refresh = with_help(QtWidgets.QPushButton("画面更新"),
+            "端末の現在の画面を撮り直して表示を更新します。")
         b_refresh.clicked.connect(self.refresh)
-        b_undo = QtWidgets.QPushButton("一つ戻す")
+        b_undo = with_help(QtWidgets.QPushButton("一つ戻す"),
+            "直前に記録したステップ、または共通ポップアップを1つ取り消します。")
         b_undo.clicked.connect(self.undo)
-        b_save = QtWidgets.QPushButton("保存して閉じる")
+        b_save = with_help(QtWidgets.QPushButton("保存して閉じる"),
+            "ここまで記録した内容をレシピとして保存し、記録ウィンドウを閉じます。")
         b_save.clicked.connect(self.save)
-        b_cancel = QtWidgets.QPushButton("キャンセル")
+        b_cancel = with_help(QtWidgets.QPushButton("キャンセル"),
+            "記録した内容を保存せずに記録ウィンドウを閉じます。")
         b_cancel.clicked.connect(self.reject)
         for b in (b_refresh, b_undo, b_save, b_cancel):
             side.addWidget(b)
 
-        side.addWidget(QtWidgets.QLabel("記録したステップ（ダブルクリックで名前変更）"))
+        side.addWidget(help_label(
+            "記録したステップ（ダブルクリックで名前変更）",
+            "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。"
+            "項目をダブルクリックすると「タップ1」のような名前を自由に変更できます。"))
         self.list_steps_edit = QtWidgets.QListWidget()
         self.list_steps_edit.setMaximumHeight(120)
         self.list_steps_edit.itemChanged.connect(self.on_step_label_edited)
         side.addWidget(self.list_steps_edit)
 
-        self.ck_popup_mode = QtWidgets.QCheckBox(
-            "共通ポップアップとして記録\n(広告や「フレンド申請」等、順序を問わず割り込んだら閉じる用)")
+        self.ck_popup_mode = with_help(
+            QtWidgets.QCheckBox(
+                "共通ポップアップとして記録\n(広告や「フレンド申請」等、順序を問わず割り込んだら閉じる用)"),
+            "ONの状態でクリックすると、そのステップは通常の順番の一部ではなく"
+            "「いつ現れても閉じる」共通ポップアップとして登録されます。"
+            "フレンド申請やイベント告知など、不定期に割り込んでくる画面の"
+            "OK/閉じるボタンに使ってください。")
         side.addWidget(self.ck_popup_mode)
 
-        side.addWidget(QtWidgets.QLabel("共通ポップアップ一覧（ダブルクリックで名前変更）"))
+        side.addWidget(help_label(
+            "共通ポップアップ一覧（ダブルクリックで名前変更）",
+            "「共通ポップアップとして記録」した画像の一覧です。再生中は、今どの"
+            "ステップを待っていてもこれらの画像が見えたら優先して閉じます。"))
         self.list_popups_edit = QtWidgets.QListWidget()
         self.list_popups_edit.setMaximumHeight(90)
         self.list_popups_edit.itemChanged.connect(self.on_popup_label_edited)
@@ -585,7 +628,9 @@ class MainWindow(QtWidgets.QWidget):
         row = QtWidgets.QHBoxLayout()
         self.ed_serial = QtWidgets.QLineEdit()
         self.ed_serial.setPlaceholderText("シリアル(複数端末時のみ)。空でOK")
-        self.btn_conn = QtWidgets.QPushButton("接続")
+        self.btn_conn = with_help(QtWidgets.QPushButton("接続"),
+            "USBでつないだAndroid端末に接続します。モデル名と画面サイズが"
+            "表示されれば成功です。記録・再生の前に一度押してください。")
         self.btn_conn.clicked.connect(self.on_connect)
         row.addWidget(QtWidgets.QLabel("端末:"))
         row.addWidget(self.ed_serial, 1)
@@ -597,7 +642,10 @@ class MainWindow(QtWidgets.QWidget):
         self.cmb_recipe = QtWidgets.QComboBox()
         self.cmb_recipe.setEditable(True)
         self.cmb_recipe.addItems(core.list_recipes())
-        row.addWidget(QtWidgets.QLabel("レシピ名:"))
+        row.addWidget(help_label(
+            "レシピ名:",
+            "記録・再生の対象となる名前です。recipes/<この名前>/ フォルダに"
+            "保存されます。新しい名前を入力すれば新規レシピとして記録できます。"))
         row.addWidget(self.cmb_recipe, 1)
         v.addLayout(row)
 
@@ -607,13 +655,24 @@ class MainWindow(QtWidgets.QWidget):
         # --- 記録タブ ---
         tab_rec = QtWidgets.QWidget()
         tv = QtWidgets.QVBoxLayout(tab_rec)
-        box = QtWidgets.QGroupBox("記録の設定（画面をクリックして記録）")
+        box = with_help(
+            QtWidgets.QGroupBox("記録の設定（画面をクリックして記録）"),
+            "端末の画面をPC上でクリックして、操作手順(レシピ)を記録します。")
         g = QtWidgets.QGridLayout(box)
         self.sp_w = QtWidgets.QSpinBox(); self.sp_w.setRange(40, 800); self.sp_w.setValue(200)
         self.sp_h = QtWidgets.QSpinBox(); self.sp_h.setRange(40, 800); self.sp_h.setValue(100)
-        g.addWidget(QtWidgets.QLabel("切抜き幅"), 0, 0); g.addWidget(self.sp_w, 0, 1)
-        g.addWidget(QtWidgets.QLabel("高さ"), 0, 2); g.addWidget(self.sp_h, 0, 3)
-        self.btn_rec = QtWidgets.QPushButton("記録開始")
+        g.addWidget(help_label(
+            "切抜き幅",
+            "クリックした位置を中心に、ボタン画像を切り抜く横幅(ピクセル)です。"
+            "大きくすると周囲の文字ごと含められ、似たボタンと区別しやすくなります。"
+            "小さすぎるとほぼ無地の画像になり、暗転画面などへの誤検知の原因になります。"), 0, 0)
+        g.addWidget(self.sp_w, 0, 1)
+        g.addWidget(help_label("高さ", "切り抜く縦幅(ピクセル)です。考え方は「切抜き幅」と同じです。"), 0, 2)
+        g.addWidget(self.sp_h, 0, 3)
+        self.btn_rec = with_help(
+            QtWidgets.QPushButton("記録開始"),
+            "上のレシピ名で記録ウィンドウを開きます。既に記録済みのレシピ名を"
+            "指定した場合は、続きから追加記録するか選べます。")
         self.btn_rec.clicked.connect(self.on_record)
         g.addWidget(self.btn_rec, 1, 0, 1, 4)
         tv.addWidget(box)
@@ -623,7 +682,9 @@ class MainWindow(QtWidgets.QWidget):
         # --- 再生タブ ---
         tab_play = QtWidgets.QWidget()
         pv = QtWidgets.QVBoxLayout(tab_play)
-        box = QtWidgets.QGroupBox("再生の設定")
+        box = with_help(
+            QtWidgets.QGroupBox("再生の設定"),
+            "記録したレシピを自動で繰り返し実行します。")
         g = QtWidgets.QGridLayout(box)
         self.sp_loops = QtWidgets.QSpinBox(); self.sp_loops.setRange(0, 100000); self.sp_loops.setValue(0)
         self.sp_thr = QtWidgets.QDoubleSpinBox(); self.sp_thr.setRange(0.5, 0.99); self.sp_thr.setSingleStep(0.01); self.sp_thr.setValue(0.85)
@@ -632,17 +693,53 @@ class MainWindow(QtWidgets.QWidget):
         self.sp_poll = QtWidgets.QDoubleSpinBox(); self.sp_poll.setRange(0.3, 10); self.sp_poll.setValue(1.5)
         self.sp_fail = QtWidgets.QSpinBox(); self.sp_fail.setRange(1, 50); self.sp_fail.setValue(3)
         self.sp_hold = QtWidgets.QSpinBox(); self.sp_hold.setRange(0, 1000); self.sp_hold.setValue(0)
-        g.addWidget(QtWidgets.QLabel("実行回数(0=無限)"), 0, 0); g.addWidget(self.sp_loops, 0, 1)
-        g.addWidget(QtWidgets.QLabel("一致しきい値"), 0, 2); g.addWidget(self.sp_thr, 0, 3)
-        g.addWidget(QtWidgets.QLabel("各ステップ最大待ち秒"), 1, 0); g.addWidget(self.sp_to, 1, 1)
-        g.addWidget(QtWidgets.QLabel("タップ後待ち秒"), 1, 2); g.addWidget(self.sp_after, 1, 3)
-        g.addWidget(QtWidgets.QLabel("確認間隔秒"), 2, 0); g.addWidget(self.sp_poll, 2, 1)
-        g.addWidget(QtWidgets.QLabel("連続失敗で停止"), 2, 2); g.addWidget(self.sp_fail, 2, 3)
-        g.addWidget(QtWidgets.QLabel("タップ長押しms(効かない時↑)"), 3, 0); g.addWidget(self.sp_hold, 3, 1)
-        self.ck_verify = QtWidgets.QCheckBox("タップ後に効いたか確認して押し直す")
+        g.addWidget(help_label(
+            "実行回数(0=無限)",
+            "再生を何回繰り返すかを指定します。0にすると「停止」を押すまで"
+            "無限に繰り返します。"), 0, 0)
+        g.addWidget(self.sp_loops, 0, 1)
+        g.addWidget(help_label(
+            "一致しきい値",
+            "記録した画像とどれだけ似ていれば「見つかった」とみなすかの基準"
+            "(0〜1、高いほど厳密)。ボタンが見つからない場合は0.80、0.75のように"
+            "下げてみてください。ログに出る「最高一致度」が目安になります。"), 0, 2)
+        g.addWidget(self.sp_thr, 0, 3)
+        g.addWidget(help_label(
+            "各ステップ最大待ち秒",
+            "1つのステップの画像が現れるまで待つ最大時間(秒)。この時間を"
+            "過ぎても見つからなければ、そのステップは失敗として扱われます。"), 1, 0)
+        g.addWidget(self.sp_to, 1, 1)
+        g.addWidget(help_label(
+            "タップ後待ち秒",
+            "ボタンをタップしてから、効いたか(消えたか)を確認するまでの"
+            "待ち時間(秒)。画面の反応が遅いアプリでは長めにしてください。"), 1, 2)
+        g.addWidget(self.sp_after, 1, 3)
+        g.addWidget(help_label(
+            "確認間隔秒",
+            "対象のボタンがまだ現れていないとき、何秒おきに画面を確認しに"
+            "いくかの間隔です。"), 2, 0)
+        g.addWidget(self.sp_poll, 2, 1)
+        g.addWidget(help_label(
+            "連続失敗で停止",
+            "同じレシピの再生が連続で何回失敗したら、再生全体を停止するかの"
+            "回数です。途中で1回でも成功すればこのカウントはリセットされます。"), 2, 2)
+        g.addWidget(self.sp_fail, 2, 3)
+        g.addWidget(help_label(
+            "タップ長押しms(効かない時↑)",
+            "タップを押している時間(ミリ秒)。0は瞬間タップ。反応が悪い"
+            "アプリではタップしても無反応になりやすいので、80〜150くらいに"
+            "上げると改善することがあります。"), 3, 0)
+        g.addWidget(self.sp_hold, 3, 1)
+        self.ck_verify = with_help(
+            QtWidgets.QCheckBox("タップ後に効いたか確認して押し直す"),
+            "ONにすると、タップ後にボタンがまだ画面に残っているか確認し、"
+            "残っていれば同じ場所を押し直します。OFFにすると1回タップした"
+            "だけで確認せずに次のステップへ進みます。")
         self.ck_verify.setChecked(True)
         g.addWidget(self.ck_verify, 3, 2, 1, 2)
-        self.btn_play = QtWidgets.QPushButton("再生開始")
+        self.btn_play = with_help(
+            QtWidgets.QPushButton("再生開始"),
+            "上で選んだレシピを、この設定で再生します。")
         self.btn_play.clicked.connect(self.on_play)
         g.addWidget(self.btn_play, 4, 0, 1, 4)
         pv.addWidget(box)
@@ -654,20 +751,30 @@ class MainWindow(QtWidgets.QWidget):
         hv = QtWidgets.QVBoxLayout(tab_hist)
 
         hist_btn_row = QtWidgets.QHBoxLayout()
-        btn_refresh_hist = QtWidgets.QPushButton("表示を更新（上のレシピ名を対象）")
+        btn_refresh_hist = with_help(
+            QtWidgets.QPushButton("表示を更新（上のレシピ名を対象）"),
+            "上のレシピ名で記録した内容や失敗の履歴を、この画面に読み込み直します。")
         btn_refresh_hist.clicked.connect(self.refresh_history)
         hist_btn_row.addWidget(btn_refresh_hist, 1)
-        btn_clear_hist = QtWidgets.QPushButton("失敗履歴・ログを消去")
+        btn_clear_hist = with_help(
+            QtWidgets.QPushButton("失敗履歴・ログを消去"),
+            "このレシピの失敗スクリーンショット・再生ログ・失敗履歴のみを"
+            "削除します。記録したステップ画像や共通ポップアップは残ります。")
         btn_clear_hist.clicked.connect(self.on_clear_history)
         hist_btn_row.addWidget(btn_clear_hist)
         hv.addLayout(hist_btn_row)
 
-        btn_delete_recipe = QtWidgets.QPushButton("このレシピを削除する")
+        btn_delete_recipe = with_help(
+            QtWidgets.QPushButton("このレシピを削除する"),
+            "レシピをフォルダごと完全に削除します。記録したステップ画像・"
+            "共通ポップアップ・失敗履歴もすべて消え、元に戻せません。")
         btn_delete_recipe.setStyleSheet("color: #b00000;")
         btn_delete_recipe.clicked.connect(self.on_delete_recipe)
         hv.addWidget(btn_delete_recipe)
 
-        box = QtWidgets.QGroupBox("記録したステップ")
+        box = with_help(
+            QtWidgets.QGroupBox("記録したステップ"),
+            "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。")
         bl = QtWidgets.QVBoxLayout(box)
         self.list_steps = QtWidgets.QListWidget()
         self.list_steps.setIconSize(QtCore.QSize(64, 64))
@@ -675,7 +782,11 @@ class MainWindow(QtWidgets.QWidget):
         bl.addWidget(self.list_steps)
         hv.addWidget(box)
 
-        box = QtWidgets.QGroupBox("共通ポップアップ（順序を問わず割り込みを閉じる）")
+        box = with_help(
+            QtWidgets.QGroupBox("共通ポップアップ（順序を問わず割り込みを閉じる）"),
+            "広告や「フレンド申請」など、どのステップの最中でも突然現れる"
+            "可能性がある画面を登録する場所です。再生中はステップの実行順序に"
+            "関係なく、これらの画像が見えたら優先して閉じてから元の操作を続けます。")
         bl = QtWidgets.QVBoxLayout(box)
         self.list_popups = QtWidgets.QListWidget()
         self.list_popups.setIconSize(QtCore.QSize(64, 64))
@@ -683,7 +794,11 @@ class MainWindow(QtWidgets.QWidget):
         bl.addWidget(self.list_popups)
         hv.addWidget(box)
 
-        box = QtWidgets.QGroupBox("よく止まる箇所（失敗回数の多い順）")
+        box = with_help(
+            QtWidgets.QGroupBox("よく止まる箇所（失敗回数の多い順）"),
+            "過去の再生でどのステップが何回失敗したかを、失敗回数の多い順に"
+            "表示します。よく失敗するステップは、しきい値や切り抜き画像を"
+            "見直す目安になります。")
         bl = QtWidgets.QVBoxLayout(box)
         self.tbl_rank = QtWidgets.QTableWidget(0, 2)
         self.tbl_rank.setHorizontalHeaderLabels(["ステップ", "失敗回数"])
@@ -696,7 +811,10 @@ class MainWindow(QtWidgets.QWidget):
         bl.addWidget(self.tbl_rank)
         hv.addWidget(box)
 
-        box = QtWidgets.QGroupBox("失敗履歴（クリックでスクリーンショット表示）")
+        box = with_help(
+            QtWidgets.QGroupBox("失敗履歴（クリックでスクリーンショット表示）"),
+            "過去に失敗した日時・ステップ・理由の一覧です。クリックすると、"
+            "その時の端末画面のスクリーンショットを右側に表示します。")
         bl = QtWidgets.QHBoxLayout(box)
         self.list_failures = QtWidgets.QListWidget()
         self.list_failures.itemClicked.connect(self.on_failure_selected)
@@ -716,7 +834,10 @@ class MainWindow(QtWidgets.QWidget):
 
         # 停止・状態
         row = QtWidgets.QHBoxLayout()
-        self.btn_stop = QtWidgets.QPushButton("停止")
+        self.btn_stop = with_help(
+            QtWidgets.QPushButton("停止"),
+            "実行中の記録・再生を止めます。再生中はキリの良いところで"
+            "止まるまで少し時間がかかることがあります。")
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_stop.setEnabled(False)
         self.lbl_stat = QtWidgets.QLabel("未接続")
