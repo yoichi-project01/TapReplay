@@ -49,12 +49,17 @@ class HelpBadge(QtWidgets.QLabel):
     def __init__(self, tip, parent=None):
         super().__init__("?", parent)
         self._tip = tip
+        self.setObjectName("helpBadge")
         self.setFixedSize(18, 18)
         self.setAlignment(QtCore.Qt.AlignCenter)
         self.setToolTip(tip)
         self.setCursor(QtCore.Qt.PointingHandCursor)
+        # "#helpBadge" で自分自身にだけ絞る。"QLabel {...}" のような
+        # 型セレクタだと、このバッジを親にして開くダイアログ内のQLabel
+        # (メッセージ本文など)にまでスタイルが伝播し、白文字×青背景で
+        # 読みにくくなってしまうため。
         self.setStyleSheet(
-            "QLabel {"
+            "QLabel#helpBadge {"
             " background-color: #3b78c2;"
             " color: white;"
             " border-radius: 9px;"
@@ -64,7 +69,7 @@ class HelpBadge(QtWidgets.QLabel):
         )
 
     def mousePressEvent(self, event):
-        QtWidgets.QMessageBox.information(self, "使い方", self._tip)
+        QtWidgets.QMessageBox.information(self.window(), "使い方", self._tip)
 
 
 def help_label(text, tip):
