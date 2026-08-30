@@ -207,6 +207,13 @@ def to_gray(pil_img):
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
 
 
+def to_bgr(pil_img):
+    """PIL画像をOpenCV(cv2.imwrite/imencode)向けのBGR配列に変換する。
+    保存用途(失敗時のスクリーンショット等)はグレースケールより
+    カラーの方が原因調査に有用なため、色付きで保存したい場面で使う"""
+    return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
 def is_distinctive(gray, min_std=35.0):
     """テンプレート画像がほぼ無地(情報量が少ない)かどうかを判定する。
     ほぼ無地の画像は暗転・読み込み画面など無関係な場所にも高い一致度で

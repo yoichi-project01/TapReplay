@@ -762,7 +762,7 @@ class PlayerThread(QtCore.QThread):
                         safe_reason = "".join(
                             c if c.isalnum() else "_" for c in str(e))[:40]
                         fname = f"error_{datetime.datetime.now():%H%M%S}_{safe_reason}.png"
-                        core.imwrite(recipe_dir / fname, core.to_gray(d.screenshot()))
+                        core.imwrite(recipe_dir / fname, core.to_bgr(d.screenshot()))
                         step_label = current_step["label"] if current_step else "?"
                         core.append_failure(self.name, step_label, str(e), fname)
                     except Exception as e2:
