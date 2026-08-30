@@ -129,6 +129,26 @@ class ClickableLabel(QtWidgets.QLabel):
         self.clicked.emit(int(e.position().x()), int(e.position().y()))
 
 
+# ==================================== ドラッグ&ドロップで並び替え可能な一覧
+class ReorderableListWidget(QtWidgets.QListWidget):
+    """InternalMoveでの並び替え中、Qt内部の実装(行の挿入→削除)により
+    itemChanged が「移動前の行番号」のまま一時的に発火することがある
+    (PySide6 6.11で確認)。これをitemChanged側のハンドラで見分けるのは
+    難しいため、dropEvent の開始～終了を dropping フラグで明示し、
+    ハンドラ側でその間は無視できるようにする"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.dropping = False
+
+    def dropEvent(self, event):
+        self.dropping = True
+        try:
+            super().dropEvent(event)
+        finally:
+            self.dropping = False
+
+
 # ============================================ 記録ダイアログ（クリック式）
 class RecorderDialog(QtWidgets.QDialog):
     def __init__(self, serial, name, tpl_w, tpl_h, parent=None):
@@ -205,7 +225,7 @@ class RecorderDialog(QtWidgets.QDialog):
             "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。"
             "項目をダブルクリックすると「タップ1」のような名前を自由に変更でき、"
             "ドラッグ＆ドロップで実行順を入れ替えられます。"))
-        self.list_steps_edit = QtWidgets.QListWidget()
+        self.list_steps_edit = ReorderableListWidget()
         self.list_steps_edit.setMaximumHeight(120)
         self.list_steps_edit.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
         self.list_steps_edit.itemChanged.connect(self.on_step_label_edited)
@@ -270,6 +290,11 @@ class RecorderDialog(QtWidgets.QDialog):
         self.refresh()
 
     def on_step_label_edited(self, item):
+        if self.list_steps_edit.dropping:
+            # ドラッグ&ドロップ中はQtの内部実装により、移動前の行番号を
+            # 指したままitemChangedが誤発火することがあるため無視する
+            # (実際の並び替え結果はrowsMoved→on_steps_reorderedで同期する)
+            return
         idx = self.list_steps_edit.row(item)
         if not (0 <= idx < len(self.steps)):
             return
@@ -1196,11 +1221,16 @@ class MainWindow(QtWidgets.QWidget):
                 list_widget.addItem(item)
 
             for i, s in enumerate(data.get("steps", []), 1):
+                # "context"を優先し、無い(古い形式の)レシピはインデックスから
+                # 組み立てる方式にフォールバックする。並び替え後はインデックスと
+                # ファイル名の番号が一致しなくなるため、"context"が信頼できる
+                ctx_name = s.get("context") or f"context_{i:02d}.png"
                 add_thumb_item(self.list_steps, f"{i}. {s.get('label', '?')}",
-                               d / f"context_{i:02d}.png")
+                               d / ctx_name)
             for i, p in enumerate(data.get("popups", []), 1):
+                ctx_name = p.get("context") or f"context_popup_{i:02d}.png"
                 add_thumb_item(self.list_popups, f"P{i}. {p.get('label', '?')}",
-                               d / f"context_popup_{i:02d}.png")
+                               d / ctx_name)
             if not data.get("popups"):
                 self.list_popups.addItem("(共通ポップアップは未登録です)")
         else:
