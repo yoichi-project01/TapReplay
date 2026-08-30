@@ -30,9 +30,22 @@ import core
 # レシピ名はフォルダ名としてそのまま使われるため、パス区切りなどは禁止する
 INVALID_NAME_CHARS = '\\/:*?"<>|'
 
+# Windows の予約デバイス名。そのままフォルダ名にするとOSエラーになる
+_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 
 def is_valid_recipe_name(name):
-    return bool(name) and not any(c in INVALID_NAME_CHARS for c in name)
+    if not name or any(c in INVALID_NAME_CHARS for c in name):
+        return False
+    if name != name.strip(" ."):
+        return False  # Windowsは末尾の空白・ピリオドを扱えない
+    if name.upper() in _RESERVED_NAMES:
+        return False
+    return True
 
 
 def pil_to_qpix(pil_img):

@@ -230,13 +230,16 @@ def imwrite(path, img):
 
 
 def crop(pil_img, cx, cy, w, h):
-    """(cx, cy) を中心に w×h で切り抜いた PIL 画像を返す"""
+    """(cx, cy) を中心に w×h で切り抜いた PIL 画像を返す。
+    画面端に近いときは、切り抜きサイズ(w×h)を保ったまま範囲を
+    内側にずらす(端を単純に切り落とすと指定サイズより小さくなり、
+    そのテンプレートを使った再生時のタップ位置計算がずれるため)"""
     sw, sh = pil_img.size
-    x1 = max(0, cx - w // 2)
-    y1 = max(0, cy - h // 2)
-    x2 = min(sw, x1 + w)
-    y2 = min(sh, y1 + h)
-    return pil_img.crop((x1, y1, x2, y2))
+    w = min(w, sw)
+    h = min(h, sh)
+    x1 = max(0, min(cx - w // 2, sw - w))
+    y1 = max(0, min(cy - h // 2, sh - h))
+    return pil_img.crop((x1, y1, x1 + w, y1 + h))
 
 
 def match(screen_gray, tpl_gray, threshold):
