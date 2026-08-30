@@ -1143,7 +1143,7 @@ class MainWindow(QtWidgets.QWidget):
         if not is_valid_recipe_name(name):
             self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
             return
-        d = core.recipe_dir(name)
+        d = core.recipe_path(name)
         targets = (list(d.glob("error_*.png")) + list(d.glob("playback_*.log")) +
                    list(d.glob("failures.jsonl")))
         if not targets:
@@ -1180,13 +1180,9 @@ class MainWindow(QtWidgets.QWidget):
         if self.worker is not None and self.worker.isRunning() and self.worker.name == name:
             self.append(f"!! 「{name}」は再生中のため削除できません。先に停止してください")
             return
-        d = core.recipe_dir(name)
+        d = core.recipe_path(name)
         if not (d / "recipe.json").exists():
             self.append(f"「{name}」はまだ記録されていません")
-            try:
-                d.rmdir()  # recipe_dir()が作った空フォルダなら片付ける
-            except OSError:
-                pass
             return
         resp = QtWidgets.QMessageBox.question(
             self, "レシピを削除",
@@ -1221,7 +1217,7 @@ class MainWindow(QtWidgets.QWidget):
         if not name:
             return
 
-        d = core.recipe_dir(name)
+        d = core.recipe_path(name)
         recipe_file = d / "recipe.json"
         if recipe_file.exists():
             try:
@@ -1281,7 +1277,7 @@ class MainWindow(QtWidgets.QWidget):
         name = self.cmb_recipe.currentText().strip()
         if not fname or not name:
             return
-        path = core.recipe_dir(name) / fname
+        path = core.recipe_path(name) / fname
         if not path.exists():
             self.lbl_fail_preview.setText("画像が見つかりません")
             return

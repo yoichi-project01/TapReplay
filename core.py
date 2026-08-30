@@ -270,8 +270,16 @@ def match(screen_gray, tpl_gray, threshold):
 
 
 # --------------------------------------------------------- レシピ入出力
+def recipe_path(name):
+    """recipes/<name> のパスを返すだけで、フォルダは作成しない。
+    存在確認や読み取りだけの処理で使うこと(recipe_dir()と違い、
+    存在しないレシピ名を指定しても空フォルダが作られない)"""
+    return RECIPES / name
+
+
 def recipe_dir(name):
-    d = RECIPES / name
+    """recipes/<name> のパスを返す。無ければ作成する(書き込み用)"""
+    d = recipe_path(name)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -284,7 +292,7 @@ def save_recipe(name, data):
 
 
 def load_recipe(name):
-    d = recipe_dir(name)
+    d = recipe_path(name)
     data = json.loads((d / "recipe.json").read_text(encoding="utf-8"))
     for step in data["steps"]:
         g = cv2.imread(str(d / step["template"]), cv2.IMREAD_GRAYSCALE)
@@ -321,7 +329,7 @@ def append_failure(name, step_label, reason, screenshot):
 
 def load_failures(name):
     """失敗履歴を新しい順のリストで返す"""
-    path = recipe_dir(name) / "failures.jsonl"
+    path = recipe_path(name) / "failures.jsonl"
     if not path.exists():
         return []
     out = []
