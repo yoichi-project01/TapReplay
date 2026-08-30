@@ -577,14 +577,16 @@ class PlayerThread(QtCore.QThread):
 
     def _find_best_match(self, gray, candidates):
         """candidates のうち今の画面に写っているものを探す(一致度が最も高いものを返す)。
-        ほぼ無地のテンプレートは暗転画面などに誤検知しやすいため対象から除外する"""
+        戻り値は (candidates内でのインデックス, 候補dict, cx, cy, val) または
+        見つからなければ None。ほぼ無地のテンプレートは暗転画面などに
+        誤検知しやすいため対象から除外する"""
         best = None
-        for s in candidates:
+        for i, s in enumerate(candidates):
             if not core.is_distinctive(s["_gray"]):
                 continue
             cx, cy, val = core.match(gray, s["_gray"], self.threshold)
-            if cx is not None and (best is None or val > best[3]):
-                best = (s, cx, cy, val)
+            if cx is not None and (best is None or val > best[4]):
+                best = (i, s, cx, cy, val)
         return best
 
     def _dismiss_popup_if_any(self, gray, popups):
@@ -593,7 +595,7 @@ class PlayerThread(QtCore.QThread):
         hit = self._find_best_match(gray, popups)
         if hit is None:
             return False
-        popup, pcx, pcy, pval = hit
+        _, popup, pcx, pcy, pval = hit
         jx = pcx + popup.get("dx", 0) + random.randint(-self.jitter, self.jitter)
         jy = pcy + popup.get("dy", 0) + random.randint(-self.jitter, self.jitter)
         core.tap(self._serial, jx, jy, self.hold_ms)
@@ -602,8 +604,21 @@ class PlayerThread(QtCore.QThread):
         time.sleep(self.after)
         return True
 
-    def _wait_and_tap(self, d, step, later_steps, popups):
+    def _wait_and_tap(self, d, all_steps, idx, popups):
+        """all_steps[idx] の画像が現れるまで待ってタップする。
+
+        見つからない間、レシピ内の"これより後の"ステップ画像が写っていない
+        かも探す。見つかればそれをタップし、再生位置をそこまで進める
+        (＝そのステップのインデックスを返す)。呼び出し元(run())は、
+        戻り値の次のインデックスから再開すること。
+
+        戻り値: 実際にタップできたステップのインデックス
+                (通常は idx 自身。この先のステップへ復帰した場合はそのインデックス)
+        タイムアウトした場合は TimeoutError を送出する。
+        """
         import random
+        step = all_steps[idx]
+        later_steps = all_steps[idx + 1:]
         deadline = time.time() + self.step_timeout
         best = 0.0
         last_report = time.time()
@@ -634,7 +649,7 @@ class PlayerThread(QtCore.QThread):
                         f"    {step['label']}: タップ({jx},{jy}) 一致{val:.2f}{tag}")
                     time.sleep(self.after)
                     if not self.verify:
-                        return
+                        return idx
                     after_gray = core.to_gray(d.screenshot())
                     # ボタンが消えずに残っているように見えても、実は共通ポップアップに
                     # 覆われていて反応していないだけ、というケースがあるため先に確認する
@@ -643,7 +658,7 @@ class PlayerThread(QtCore.QThread):
                         break
                     ncx, ncy, nval = core.match(after_gray, step["_gray"], self.threshold)
                     if ncx is None:
-                        return  # ボタンが消えた＝タップ成功、次へ
+                        return idx  # ボタンが消えた＝タップ成功、次へ
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
                     cx, cy = ncx, ncy
                     self._log(
@@ -662,15 +677,18 @@ class PlayerThread(QtCore.QThread):
             # 写っていないか探す(前のステップは対象にしない)
             other = self._find_best_match(gray, later_steps)
             if other is not None:
-                other_step, ocx, ocy, oval = other
+                local_idx, other_step, ocx, ocy, oval = other
+                target_idx = idx + 1 + local_idx
                 jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
                 jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
                 core.tap(self._serial, jx, jy, self.hold_ms)
                 self._log(
-                    f"    !! {step['label']} は見つかりませんが、この先のステップ画像"
-                    f"「{other_step['label']}」を検知(一致{oval:.2f})したのでタップしました")
+                    f"    !! ステップ{idx + 1}「{step['label']}」をスキップして"
+                    f"ステップ{target_idx + 1}「{other_step['label']}」へ進みました"
+                    f"(この先の画像を検知・一致{oval:.2f})")
                 time.sleep(self.after)
-                continue
+                # 元の対象を待ち続けても二度と現れないので、進んだ先から再開する
+                return target_idx
 
             # まだ見つからない → 数秒おきに現在の一致度を報告
             if time.time() - last_report >= 3:
@@ -721,9 +739,12 @@ class PlayerThread(QtCore.QThread):
                 self._log(f"=== ループ {cycle} ===")
                 current_step = None
                 try:
-                    for idx, step in enumerate(data["steps"]):
-                        current_step = step
-                        self._wait_and_tap(d, step, data["steps"][idx + 1:], popups)
+                    step_idx = 0
+                    n_steps = len(data["steps"])
+                    while step_idx < n_steps:
+                        current_step = data["steps"][step_idx]
+                        reached = self._wait_and_tap(d, data["steps"], step_idx, popups)
+                        step_idx = reached + 1
                     ok += 1
                     ng_streak = 0  # 連続失敗カウントは成功したらリセット
                     self.sig_cycle.emit(ok, ng_total)
