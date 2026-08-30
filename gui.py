@@ -378,7 +378,7 @@ class RecorderDialog(QtWidgets.QDialog):
                       (rx + self.tpl_w // 2, ry + self.tpl_h // 2),
                       (0, 0, 255), 4)
 
-        crop_img = core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h)
+        crop_img, (dx, dy) = core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h)
         is_distinctive = core.is_distinctive(core.to_gray(crop_img))
 
         if self.ck_popup_mode.isChecked():
@@ -388,7 +388,7 @@ class RecorderDialog(QtWidgets.QDialog):
             crop_img.save(self.dir / tpl)
             core.imwrite(self.dir / ctx_name, ctx)
             new_item = {"label": f"ポップアップ{idx}", "template": tpl,
-                        "context": ctx_name, "x": rx, "y": ry}
+                        "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy}
             self.popups.append(new_item)
             self._history.append(("popup", new_item))
             self._msg(f"popup{idx}: ({rx},{ry}) → {tpl} (共通ポップアップとして記録)")
@@ -399,7 +399,7 @@ class RecorderDialog(QtWidgets.QDialog):
             crop_img.save(self.dir / tpl)
             core.imwrite(self.dir / ctx_name, ctx)
             new_item = {"label": f"タップ{idx}", "template": tpl,
-                        "context": ctx_name, "x": rx, "y": ry}
+                        "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy}
             self.steps.append(new_item)
             self._history.append(("step", new_item))
             self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
@@ -516,8 +516,8 @@ class PlayerThread(QtCore.QThread):
         if hit is None:
             return False
         popup, pcx, pcy, pval = hit
-        jx = pcx + random.randint(-self.jitter, self.jitter)
-        jy = pcy + random.randint(-self.jitter, self.jitter)
+        jx = pcx + popup.get("dx", 0) + random.randint(-self.jitter, self.jitter)
+        jy = pcy + popup.get("dy", 0) + random.randint(-self.jitter, self.jitter)
         core.tap(self._serial, jx, jy, self.hold_ms)
         self._log(
             f"    !! 共通ポップアップ「{popup['label']}」を検知(一致{pval:.2f})したので閉じました")
@@ -548,8 +548,8 @@ class PlayerThread(QtCore.QThread):
                 # （背景アニメに惑わされない）
                 popup_interrupted = False
                 for attempt in range(1, self.tap_retry + 1):
-                    jx = cx + random.randint(-self.jitter, self.jitter)
-                    jy = cy + random.randint(-self.jitter, self.jitter)
+                    jx = cx + step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
+                    jy = cy + step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
                     core.tap(self._serial, jx, jy, self.hold_ms)
                     tag = f" [{attempt}回目]" if attempt > 1 else ""
                     self._log(
@@ -585,8 +585,8 @@ class PlayerThread(QtCore.QThread):
             other = self._find_best_match(gray, later_steps)
             if other is not None:
                 other_step, ocx, ocy, oval = other
-                jx = ocx + random.randint(-self.jitter, self.jitter)
-                jy = ocy + random.randint(-self.jitter, self.jitter)
+                jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
+                jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
                 core.tap(self._serial, jx, jy, self.hold_ms)
                 self._log(
                     f"    !! {step['label']} は見つかりませんが、この先のステップ画像"
