@@ -144,6 +144,10 @@ class RecorderDialog(QtWidgets.QDialog):
         self.steps = []
         self.popups = []
         self._history = []  # 記録順の "step"/"popup" 履歴(一つ戻す用)
+        # 「最初からやり直す」を選んだ時、削除対象の古いファイル名を
+        # 保持しておく集合。保存(save)するまでは実際には削除しない
+        # (キャンセルされた場合に元のレシピを壊さないため)
+        self._purge_on_save = None
         self.pil = None
         self.scale = 1.0
 
@@ -303,7 +307,8 @@ class RecorderDialog(QtWidgets.QDialog):
             f"「{self.name}」には既に{len(prev_steps)}ステップ"
             f"・{len(prev_popups)}件の共通ポップアップが記録されています。\n\n"
             "「はい」: プログラムが止まった続きから追加記録する\n"
-            "「いいえ」: 最初からやり直す（既存の記録は削除されます）",
+            "「いいえ」: 最初からやり直す（「保存して閉じる」を押すまでは"
+            "元の記録は消えません。キャンセルすれば元のまま残ります）",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes,
         )
@@ -321,14 +326,18 @@ class RecorderDialog(QtWidgets.QDialog):
                     f"!! 注意: 記録時({dev_size})と今の画面サイズ"
                     f"({self.sw},{self.sh})が違います")
         else:
+            # ここでは削除しない。保存(save)まで遅らせることで、
+            # このままキャンセルされた場合に元のレシピを壊さないようにする。
+            # 削除対象の候補だけ覚えておき、save()で実際に使われなかった
+            # ものだけを消す
+            self._purge_on_save = set()
             for pattern in ("step_*.png", "context_*.png",
                              "popup_*.png", "context_popup_*.png"):
                 for f in self.dir.glob(pattern):
-                    try:
-                        f.unlink()
-                    except Exception:
-                        pass
-            self._msg("既存の記録を削除し、最初から記録します")
+                    self._purge_on_save.add(f.name)
+            self._msg(
+                "最初からやり直します。「保存して閉じる」を押すまで元の記録は"
+                "残ります（キャンセルすれば元のまま使えます）")
 
     def _msg(self, m):
         self.log.appendPlainText(m)
@@ -447,6 +456,26 @@ class RecorderDialog(QtWidgets.QDialog):
         if not self.steps:
             self._msg("!! 1つもクリックされていません")
             return
+        if self._purge_on_save:
+            # 「最初からやり直す」で保留していた古いファイルのうち、
+            # 新しい記録で使われなかったものだけをここで削除する
+            # (同じ番号を再利用したファイルは新しい内容で上書き済みなので残す)
+            keep = set()
+            for item in self.steps + self.popups:
+                keep.add(item.get("template"))
+                keep.add(item.get("context"))
+            removed = 0
+            for fname in self._purge_on_save:
+                if fname in keep:
+                    continue
+                try:
+                    (self.dir / fname).unlink()
+                    removed += 1
+                except Exception:
+                    pass
+            if removed:
+                self._msg(f"古い記録のファイルを{removed}件削除しました")
+            self._purge_on_save = None
         core.save_recipe(self.name, {
             "device_size": [self.sw, self.sh],
             "popups": self.popups,
