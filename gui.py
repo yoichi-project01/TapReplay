@@ -148,6 +148,7 @@ class RecorderDialog(QtWidgets.QDialog):
         # 保持しておく集合。保存(save)するまでは実際には削除しない
         # (キャンセルされた場合に元のレシピを壊さないため)
         self._purge_on_save = None
+        self._dirty = False  # 保存していない変更があるか(閉じる時の確認用)
         self.pil = None
         self.scale = 1.0
 
@@ -188,7 +189,9 @@ class RecorderDialog(QtWidgets.QDialog):
         b_save = QtWidgets.QPushButton("保存して閉じる")
         b_save.clicked.connect(self.save)
         b_cancel = QtWidgets.QPushButton("キャンセル")
-        b_cancel.clicked.connect(self.reject)
+        # reject()ではなくclose()にすることで、ウィンドウの「×」と挙動を揃える
+        # (closeEvent側で未保存の変更があれば確認する)
+        b_cancel.clicked.connect(self.close)
         for b, tip in (
             (b_refresh, "端末の現在の画面を撮り直して表示を更新します。"),
             (b_undo, "直前に記録したステップ、または共通ポップアップを1つ取り消します。"),
@@ -262,6 +265,7 @@ class RecorderDialog(QtWidgets.QDialog):
             self.list_steps_edit.item(i).data(QtCore.Qt.UserRole)
             for i in range(self.list_steps_edit.count())
         ]
+        self._dirty = True
         self._msg("ステップの順番を変更しました")
         self.refresh()
 
@@ -272,6 +276,7 @@ class RecorderDialog(QtWidgets.QDialog):
         new_label = item.text().strip()
         if new_label:
             self.steps[idx]["label"] = new_label
+            self._dirty = True
             self._msg(f"step{idx + 1} の名前を「{new_label}」に変更しました")
         else:
             item.setText(self.steps[idx]["label"])  # 空にはできない
@@ -283,6 +288,7 @@ class RecorderDialog(QtWidgets.QDialog):
         new_label = item.text().strip()
         if new_label:
             self.popups[idx]["label"] = new_label
+            self._dirty = True
             self._msg(f"popup{idx + 1} の名前を「{new_label}」に変更しました")
         else:
             item.setText(self.popups[idx]["label"])  # 空にはできない
@@ -342,6 +348,22 @@ class RecorderDialog(QtWidgets.QDialog):
     def _msg(self, m):
         self.log.appendPlainText(m)
 
+    def closeEvent(self, event):
+        """ウィンドウの「×」・「キャンセル」共通の終了処理。
+        保存していない記録がある場合は破棄してよいか確認する"""
+        if self._dirty:
+            resp = QtWidgets.QMessageBox.question(
+                self, "確認",
+                "保存していない記録内容があります。保存せずに閉じますか？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if resp != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
+        self.setResult(QtWidgets.QDialog.Rejected)
+        event.accept()
+
     def refresh(self):
         try:
             self.pil = self.d.screenshot()
@@ -379,6 +401,7 @@ class RecorderDialog(QtWidgets.QDialog):
     def on_click(self, lx, ly):
         if self.pil is None:
             return
+        self._dirty = True
         rx = int(lx / self.scale)
         ry = int(ly / self.scale)
         ctx = cv2.cvtColor(np.array(self.pil), cv2.COLOR_RGB2BGR)
@@ -448,6 +471,7 @@ class RecorderDialog(QtWidgets.QDialog):
                     (self.dir / fname).unlink()
                 except Exception:
                     pass
+        self._dirty = True
         self._msg(f"「{obj['label']}」を取り消しました")
         self._refresh_lists()
         self.refresh()
@@ -971,6 +995,23 @@ class MainWindow(QtWidgets.QWidget):
     def append(self, msg):
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.log.appendPlainText(f"[{stamp}] {msg}")
+
+    def closeEvent(self, event):
+        """再生中に「停止」を押さずウィンドウを閉じても、PlayerThreadが
+        動いたままアプリが終了して QThread のクラッシュにならないようにする"""
+        if self.worker is not None and self.worker.isRunning():
+            self.lbl_stat.setText("終了処理中…")
+            self.append("終了処理中… 再生スレッドの停止を待っています")
+            # setText直後はまだ画面に反映されていないため、
+            # 後続のwait()でブロックする前に強制的に描画させる
+            QtWidgets.QApplication.processEvents()
+            self.worker.stop()
+            finished = self.worker.wait(5000)
+            if not finished:
+                self.append(
+                    "!! 再生スレッドが5秒以内に停止しませんでした。"
+                    "終了処理を続行します")
+        event.accept()
 
     def on_connect(self):
         self.serial = self.ed_serial.text().strip() or None
