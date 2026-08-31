@@ -629,6 +629,18 @@ class PlayerThread(QtCore.QThread):
     sig_cycle = QtCore.Signal(int, int)   # (成功, 失敗)
     sig_done = QtCore.Signal()
 
+    # 共通ポップアップの探索を間引く最小間隔(秒)。実測(1920x1080画面 x
+    # 200x100テンプレ)でmasked_zncc 1回は約137ms(ccoeffの約2.6倍)かかり、
+    # ポップアップは登録されている全件を毎ポーリング走査するため、件数が
+    # 増えると1回の確認だけで数百ms〜1秒近くに膨らみ、既定のポーリング間隔
+    # (1.5秒)を圧迫する。本命ステップの検出は毎回そのまま行いつつ、
+    # ポップアップ側の探索頻度だけをこの間隔に落とすことで、検出の
+    # 反応速度をあまり犠牲にせずに総コストを下げる。
+    # (ROIによる探索範囲の絞り込みも検討したが、dx/dyのずれや画面回転などで
+    # 記録位置と実際の出現位置がずれるケースの考慮・検証が増えて複雑になる
+    # ため、まずは副作用の少ない間引きを採用した)
+    POPUP_CHECK_INTERVAL = 1.0
+
     def __init__(self, serial, name, loops, threshold_offset,
                  step_timeout, after, poll, jitter, max_fail,
                  verify=True, tap_retry=3, hold_ms=0):
@@ -648,6 +660,10 @@ class PlayerThread(QtCore.QThread):
         self._serial = serial
         self._stop = False
         self._log_file = None
+        self._last_popup_check = 0.0
+        # 直近の失敗で「どの手法がどれだけ迫っていたか」を保持しておき、
+        # failures.jsonlへの記録(【実装3】)に使う
+        self._last_attempts = None
 
     def stop(self):
         self._stop = True
@@ -675,18 +691,69 @@ class PlayerThread(QtCore.QThread):
             return self.threshold_offset
         return base + self.threshold_offset
 
+    def _effective_threshold_edge(self, step):
+        """エッジフォールバック(method="edge")用のしきい値を返す。
+
+        エッジのスコアはmasked_zncc/ccoeffとは尺度が全く異なる(目安は
+        0.45前後 vs 0.85前後)ため、ステップの"threshold"を使い回さない。
+        記録時に専用の"threshold_edge"を実測して保存する案もあったが、
+        エッジ検出はあくまでmasked_zncc失敗時だけの補助的なフォールバック
+        であり、記録のたびに追加でマッチングして精密なしきい値を実測する
+        コストに見合わないと判断し、手法ごとの固定値(core.DEFAULT_THRESHOLDS)
+        を使うことにした。GUIの全体オフセット(±0.2)もmasked_znccの尺度に
+        合わせたものなので、ここには適用しない(スケールが違いすぎて
+        意味がずれるため)"""
+        return core.DEFAULT_THRESHOLDS["edge"]
+
+    def _match_candidate(self, gray, cand):
+        """candをgray画面に対してマッチングする(【実装1】【実装2】)。
+
+        candの"method"(無ければ"ccoeff")に応じてcore.match()を呼び分ける。
+        method="masked_zncc"のステップが見つからなかった場合に限り、同じ
+        画面に対してmethod="edge"でもフォールバック探索する。method="ccoeff"
+        (旧レシピ)ではフォールバックしない(既存レシピの挙動を変えないため)。
+
+        戻り値: (cx, cy, val, method_used, thr_used, attempts)
+            - 見つかった場合: cx/cyはタップ位置、method_usedは実際に
+              検出できた手法("edge"ならフォールバックで見つかったことを示す)
+            - 見つからなかった場合: cx=cy=None。method_used/thr_usedは
+              主手法(candの"method")のもの
+            - attempts: [(method, val, threshold), ...] 試した手法すべての
+              記録(ログ・failures.jsonl用)
+        """
+        method = cand.get("method", "ccoeff")
+        thr = self._effective_threshold(cand)
+        mask = cand.get("_mask") if method == "masked_zncc" else None
+        cx, cy, val = core.match(gray, cand["_gray"], thr, method=method, mask=mask)
+        attempts = [(method, val, thr)]
+        if cx is not None:
+            return cx, cy, val, method, thr, attempts
+        if method == "masked_zncc":
+            edge_thr = self._effective_threshold_edge(cand)
+            ecx, ecy, eval_ = core.match(gray, cand["_gray"], edge_thr, method="edge")
+            attempts.append(("edge", eval_, edge_thr))
+            if ecx is not None:
+                return ecx, ecy, eval_, "edge", edge_thr, attempts
+        return None, None, val, method, thr, attempts
+
+    def _attempts_summary(self, best_by_method):
+        """{手法名: (最高一致度, しきい値)} を failures.jsonl 用のJSON化しやすい
+        リスト形式に変換する(【実装3】)"""
+        return [{"method": m, "score": round(float(v), 3), "threshold": round(float(t), 3)}
+                for m, (v, t) in best_by_method.items()]
+
     def _find_best_match(self, gray, candidates):
         """candidates のうち今の画面に写っているものを探す(一致度が最も高いものを返す)。
-        戻り値は (candidates内でのインデックス, 候補dict, cx, cy, val) または
-        見つからなければ None。ほぼ無地のテンプレートは暗転画面などに
-        誤検知しやすいため対象から除外する"""
+        戻り値は (candidates内でのインデックス, 候補dict, cx, cy, val,
+        method_used, thr_used, attempts) または見つからなければ None。
+        ほぼ無地のテンプレートは暗転画面などに誤検知しやすいため対象から除外する"""
         best = None
         for i, s in enumerate(candidates):
             if not core.is_distinctive(s["_gray"]):
                 continue
-            cx, cy, val = core.match(gray, s["_gray"], self._effective_threshold(s))
+            cx, cy, val, method_used, thr_used, attempts = self._match_candidate(gray, s)
             if cx is not None and (best is None or val > best[4]):
-                best = (i, s, cx, cy, val)
+                best = (i, s, cx, cy, val, method_used, thr_used, attempts)
         return best
 
     def _dismiss_popup_if_any(self, gray, popups):
@@ -695,14 +762,27 @@ class PlayerThread(QtCore.QThread):
         hit = self._find_best_match(gray, popups)
         if hit is None:
             return False
-        _, popup, pcx, pcy, pval = hit
+        _, popup, pcx, pcy, pval, pmethod, pthr, pattempts = hit
         jx = pcx + popup.get("dx", 0) + random.randint(-self.jitter, self.jitter)
         jy = pcy + popup.get("dy", 0) + random.randint(-self.jitter, self.jitter)
         core.tap(self._serial, jx, jy, self.hold_ms)
+        fallback_note = "(エッジ判定で検出)" if pmethod == "edge" else ""
         self._log(
-            f"    !! 共通ポップアップ「{popup['label']}」を検知(一致{pval:.2f})したので閉じました")
+            f"    !! 共通ポップアップ「{popup['label']}」を検知"
+            f"(一致{pval:.2f}[{pmethod}]){fallback_note}したので閉じました")
         time.sleep(self.after)
         return True
+
+    def _maybe_dismiss_popup(self, gray, popups):
+        """待機ループ中の共通ポップアップ探索を間引いて呼ぶ(POPUP_CHECK_INTERVAL秒に1回)。
+        タップ直後の「効いたか確認」時は_dismiss_popup_if_anyを直接呼ぶこと
+        (頻度が低くタップのたびなので間引く必要が薄く、割り込み検知の
+        取りこぼしを避けたいため)"""
+        now = time.time()
+        if now - self._last_popup_check < self.POPUP_CHECK_INTERVAL:
+            return False
+        self._last_popup_check = now
+        return self._dismiss_popup_if_any(gray, popups)
 
     def _wait_and_tap(self, d, all_steps, idx, popups):
         """all_steps[idx] の画像が現れるまで待ってタップする。
@@ -719,27 +799,36 @@ class PlayerThread(QtCore.QThread):
         import random
         step = all_steps[idx]
         later_steps = all_steps[idx + 1:]
-        thr = self._effective_threshold(step)
         deadline = time.time() + self.step_timeout
-        best = 0.0
+        # best_by_method: {手法名: (これまでの最高一致度, その時のしきい値)}。
+        # 試した手法すべての最高値を残しておき、タイムアウト/失敗時の
+        # ヒント表示とfailures.jsonlへの記録(【実装3】)に使う
+        best_by_method = {}
+        self._last_attempts = None
         last_report = time.time()
         while time.time() < deadline:
             if self._stop:
                 raise KeyboardInterrupt
             gray = core.to_gray(d.screenshot())
 
-            # 共通ポップアップは、対象ステップの探索より先に毎回チェックする
-            # (どのステップを待っていても、順序に関係なく割り込んで閉じる)
-            if self._dismiss_popup_if_any(gray, popups):
+            # 共通ポップアップは、対象ステップの探索より先にチェックする
+            # (どのステップを待っていても、順序に関係なく割り込んで閉じる)。
+            # ただしmasked_znccは重いため、間引いて探索する(POPUP_CHECK_INTERVAL)
+            if self._maybe_dismiss_popup(gray, popups):
                 continue
 
-            cx, cy, val = core.match(gray, step["_gray"], thr)
-            best = max(best, val)
+            cx, cy, val, method_used, thr_used, attempts = self._match_candidate(gray, step)
+            for m, v, t in attempts:
+                cur = best_by_method.get(m)
+                if cur is None or v > cur[0]:
+                    best_by_method[m] = (v, t)
+            self._last_attempts = self._attempts_summary(best_by_method)
 
             if cx is not None:
                 # 見つかった → タップ。効かなければ押し直す。
                 # 成功判定は「押したボタンが画面から消えたか」で見る
                 # （背景アニメに惑わされない）
+                fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
                 popup_interrupted = False
                 for attempt in range(1, self.tap_retry + 1):
                     jx = cx + step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
@@ -747,23 +836,32 @@ class PlayerThread(QtCore.QThread):
                     core.tap(self._serial, jx, jy, self.hold_ms)
                     tag = f" [{attempt}回目]" if attempt > 1 else ""
                     self._log(
-                        f"    {step['label']}: タップ({jx},{jy}) 一致{val:.2f}{tag}")
+                        f"    {step['label']}: タップ({jx},{jy}) "
+                        f"一致{val:.2f}[{method_used}]{fallback_note}{tag}")
                     time.sleep(self.after)
                     if not self.verify:
                         return idx
                     after_gray = core.to_gray(d.screenshot())
                     # ボタンが消えずに残っているように見えても、実は共通ポップアップに
                     # 覆われていて反応していないだけ、というケースがあるため先に確認する
+                    # (タップ直後の確認は頻度が低いため間引かず毎回チェックする)
                     if self._dismiss_popup_if_any(after_gray, popups):
                         popup_interrupted = True
                         break
-                    ncx, ncy, nval = core.match(after_gray, step["_gray"], thr)
+                    ncx, ncy, nval, nmethod, nthr, nattempts = self._match_candidate(
+                        after_gray, step)
+                    for m, v, t in nattempts:
+                        cur = best_by_method.get(m)
+                        if cur is None or v > cur[0]:
+                            best_by_method[m] = (v, t)
                     if ncx is None:
                         return idx  # ボタンが消えた＝タップ成功、次へ
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
-                    cx, cy = ncx, ncy
+                    cx, cy, method_used = ncx, ncy, nmethod
+                    fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
                     self._log(
-                        f"    …まだボタンが残っています(一致{nval:.2f})。押し直します")
+                        f"    …まだボタンが残っています(一致{nval:.2f}[{nmethod}])。押し直します")
+                self._last_attempts = self._attempts_summary(best_by_method)
                 if popup_interrupted:
                     continue  # ポップアップを閉じたので対象を探し直す
                 self._log(
@@ -778,15 +876,16 @@ class PlayerThread(QtCore.QThread):
             # 写っていないか探す(前のステップは対象にしない)
             other = self._find_best_match(gray, later_steps)
             if other is not None:
-                local_idx, other_step, ocx, ocy, oval = other
+                local_idx, other_step, ocx, ocy, oval, omethod, othr, oattempts = other
                 target_idx = idx + 1 + local_idx
                 jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
                 jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
                 core.tap(self._serial, jx, jy, self.hold_ms)
+                fallback_note = "(エッジ判定で検出)" if omethod == "edge" else ""
                 self._log(
                     f"    !! ステップ{idx + 1}「{step['label']}」をスキップして"
                     f"ステップ{target_idx + 1}「{other_step['label']}」へ進みました"
-                    f"(この先の画像を検知・一致{oval:.2f})")
+                    f"(この先の画像を検知・一致{oval:.2f}[{omethod}]){fallback_note}")
                 time.sleep(self.after)
                 # 元の対象を待ち続けても二度と現れないので、進んだ先から再開する
                 return target_idx
@@ -794,20 +893,23 @@ class PlayerThread(QtCore.QThread):
             # まだ見つからない → 数秒おきに現在の一致度を報告
             if time.time() - last_report >= 3:
                 last_report = time.time()
-                self._log(
-                    f"    待機中… {step['label']} 最高一致度 {best:.2f} "
-                    f"(しきい値 {thr:.2f})")
+                detail = " / ".join(
+                    f"{m}:{v:.2f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
+                self._log(f"    待機中… {step['label']} 最高一致度 {detail}")
             time.sleep(self.poll)
 
         # タイムアウト → 最高一致度から原因を推定してヒントを出す
-        if best >= thr - 0.05:
+        primary_method = step.get("method", "ccoeff")
+        primary_val, primary_thr = best_by_method.get(primary_method, (0.0, 0.0))
+        if primary_val >= primary_thr - 0.05:
             hint = "→ ほぼ一致。しきい値を少し下げれば拾えそう"
-        elif best >= 0.6:
+        elif primary_val >= 0.6:
             hint = "→ 惜しい。切抜きを見直すか、しきい値を下げる"
         else:
             hint = "→ この画面に対象が無い。前のタップが効いていない可能性大"
-        raise TimeoutError(
-            f"{step['label']} が出現せず (最高一致度 {best:.2f}) {hint}")
+        detail = " / ".join(
+            f"{m}:{v:.2f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
+        raise TimeoutError(f"{step['label']} が出現せず ({detail}) {hint}")
 
     def run(self):
         recipe_dir = core.recipe_dir(self.name)
@@ -874,7 +976,8 @@ class PlayerThread(QtCore.QThread):
                         fname = f"error_{datetime.datetime.now():%H%M%S}_{safe_reason}.png"
                         core.imwrite(recipe_dir / fname, core.to_bgr(d.screenshot()))
                         step_label = current_step["label"] if current_step else "?"
-                        core.append_failure(self.name, step_label, str(e), fname)
+                        core.append_failure(self.name, step_label, str(e), fname,
+                                             attempts=self._last_attempts)
                     except Exception as e2:
                         self._log(f"!! 失敗時のスクリーンショット保存に失敗: {e2}")
                     if ng_streak >= self.max_fail:
@@ -1391,6 +1494,13 @@ class MainWindow(QtWidgets.QWidget):
 
         for f in failures[:100]:
             text = f"{f.get('ts', '?')}  {f.get('step_label', '?')}  {f.get('reason', '')[:30]}"
+            # attempts: そのステップの検出で試した手法ごとの最高一致度
+            # (【実装3】)。どの手法が実際に効いているかを一覧で分かるようにする
+            attempts = f.get("attempts")
+            if attempts:
+                summary = " / ".join(
+                    f"{a.get('method', '?')}:{a.get('score', 0):.2f}" for a in attempts)
+                text += f"  [{summary}]"
             item = QtWidgets.QListWidgetItem(text)
             item.setData(QtCore.Qt.UserRole, f.get("screenshot"))
             self.list_failures.addItem(item)

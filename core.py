@@ -286,8 +286,13 @@ def list_recipes():
 
 
 # --------------------------------------------------------- 失敗履歴の記録
-def append_failure(name, step_label, reason, screenshot):
-    """再生失敗を1件、recipes/<name>/failures.jsonl に追記する"""
+def append_failure(name, step_label, reason, screenshot, attempts=None):
+    """再生失敗を1件、recipes/<name>/failures.jsonl に追記する。
+
+    attempts: そのステップの検出で試した手法ごとの最高一致度の記録
+    (例: [{"method": "masked_zncc", "score": 0.62, "threshold": 0.75}, ...])。
+    「どの手法が実際に効いているか」を失敗履歴タブで後から判断できるように
+    残しておく任意項目(旧レシピ・呼び出し元がまだ対応していない場合はNone)"""
     d = recipe_dir(name)
     rec = {
         "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -295,6 +300,8 @@ def append_failure(name, step_label, reason, screenshot):
         "reason": reason,
         "screenshot": screenshot,
     }
+    if attempts:
+        rec["attempts"] = attempts
     with open(d / "failures.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
