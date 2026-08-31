@@ -89,7 +89,9 @@ def tap(serial, x, y, hold_ms=0):
 
 # ------------------------------------------------------- 画像マッチング
 def to_gray(pil_img):
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
+    # 端末によってはスクリーンショットがRGBA(4チャンネル)で返ることがあり、
+    # その場合COLOR_RGB2GRAYは例外になるため、先にRGBへ変換しておく
+    return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
 
 
 def to_bgr(pil_img):
