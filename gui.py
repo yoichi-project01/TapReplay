@@ -870,6 +870,7 @@ class MainWindow(QtWidgets.QWidget):
         self.sp_poll = QtWidgets.QDoubleSpinBox(); self.sp_poll.setRange(0.3, 10); self.sp_poll.setValue(1.5)
         self.sp_fail = QtWidgets.QSpinBox(); self.sp_fail.setRange(1, 50); self.sp_fail.setValue(3)
         self.sp_hold = QtWidgets.QSpinBox(); self.sp_hold.setRange(0, 1000); self.sp_hold.setValue(0)
+        self.sp_jitter = QtWidgets.QSpinBox(); self.sp_jitter.setRange(0, 100); self.sp_jitter.setValue(6)
         g.addWidget(help_label(
             "実行回数(0=無限)",
             "再生を何回繰り返すかを指定します。0にすると「停止」を押すまで"
@@ -914,10 +915,17 @@ class MainWindow(QtWidgets.QWidget):
             "ONにすると、タップ後にボタンがまだ画面に残っているか確認し、"
             "残っていれば同じ場所を押し直します。OFFにすると1回タップした"
             "だけで確認せずに次のステップへ進みます。"), 3, 2, 1, 2)
+        g.addWidget(help_label(
+            "タップ位置のばらつきpx",
+            "タップする座標を毎回この範囲内でランダムにずらす量(ピクセル)。"
+            "0にすると常に全く同じ座標をタップします。同じ場所ばかり連打する"
+            "ことで一部のアプリの不正操作対策に引っかかるのを避けるためのもので、"
+            "通常は初期値のままで問題ありません。"), 4, 0)
+        g.addWidget(self.sp_jitter, 4, 1)
         self.btn_play = QtWidgets.QPushButton("再生開始")
         self.btn_play.clicked.connect(self.on_play)
         g.addWidget(with_help(
-            self.btn_play, "上で選んだレシピを、この設定で再生します。"), 4, 0, 1, 4)
+            self.btn_play, "上で選んだレシピを、この設定で再生します。"), 5, 0, 1, 4)
         pv.addLayout(groupbox_help("記録したレシピを自動で繰り返し実行します。"))
         pv.addWidget(box)
         pv.addStretch(1)
@@ -1108,7 +1116,7 @@ class MainWindow(QtWidgets.QWidget):
             self.serial, name,
             self.sp_loops.value(), self.sp_thr.value(),
             self.sp_to.value(), self.sp_after.value(),
-            self.sp_poll.value(), 6, self.sp_fail.value(),
+            self.sp_poll.value(), self.sp_jitter.value(), self.sp_fail.value(),
             verify=self.ck_verify.isChecked(), tap_retry=3,
             hold_ms=self.sp_hold.value()
         )
