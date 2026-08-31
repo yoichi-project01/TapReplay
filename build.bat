@@ -35,12 +35,16 @@ pyinstaller --noconfirm --onedir --console ^
   --collect-all cv2 ^
   gui.py
 
+REM  直後に退避しておかないと、この後のmoveコマンドの結果で
+REM  errorlevelが上書きされてしまい、pyinstallerの成否を判定できない
+set BUILD_ERR=%errorlevel%
+
 if exist "%BACKUP_DIR%" (
     if exist "%RECIPES_DIR%" rmdir /s /q "%RECIPES_DIR%"
     move "%BACKUP_DIR%" "%RECIPES_DIR%" >nul
 )
 
-if errorlevel 1 (
+if %BUILD_ERR% neq 0 (
     echo.
     echo !! ビルドに失敗しました。上のエラーを確認してください。
     pause
