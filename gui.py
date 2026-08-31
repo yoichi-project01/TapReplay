@@ -470,7 +470,7 @@ class RecorderDialog(QtWidgets.QDialog):
         if self.ck_send.isChecked():
             try:
                 core.tap(self.serial or self.d.serial, rx, ry)
-                self._msg(f"  端末にタップ送信 → 画面更新までクリック無効…")
+                self._msg("  端末にタップ送信 → 画面更新までクリック無効…")
             except Exception as e:
                 self._msg(f"  !! タップ送信失敗: {e}")
             # 更新が終わるまで誤クリック（古い画面での記録）を防ぐ
