@@ -170,7 +170,7 @@ THRESHOLD_AUTO_MIN = 0.5
 
 # ============================================ 記録ダイアログ（クリック式）
 class RecorderDialog(QtWidgets.QDialog):
-    def __init__(self, serial, name, tpl_w, tpl_h, parent=None):
+    def __init__(self, serial, name, tpl_w, tpl_h, parent=None, retake_label=None):
         super().__init__(parent)
         self.setWindowTitle(f"記録: {name}")
         self.serial = serial
@@ -185,11 +185,16 @@ class RecorderDialog(QtWidgets.QDialog):
         self._history = []  # 記録順の "step"/"popup" 履歴(一つ戻す用)
         # 「最初からやり直す」を選んだ時、削除対象の古いファイル名を
         # 保持しておく集合。保存(save)するまでは実際には削除しない
-        # (キャンセルされた場合に元のレシピを壊さないため)
+        # (キャンセルされた場合に元のレシピを壊さないため)。
+        # 撮り直し(【撮り直し機能】)で差し替え前の古いファイルを消す際もこれに合流させる
         self._purge_on_save = None
         self._dirty = False  # 保存していない変更があるか(閉じる時の確認用)
         self.pil = None
         self.scale = 1.0
+        # 撮り直し対象として選ばれているステップ(dict、self.stepsの要素そのもの)。
+        # Noneでなければ、次のon_clickは新規ステップ追加ではなく撮り直しとして扱う
+        self._retake_step = None
+        self._retake_seq = 0  # 撮り直しで書き出すファイル名の重複防止用連番
 
         root = QtWidgets.QHBoxLayout(self)
 
@@ -251,6 +256,16 @@ class RecorderDialog(QtWidgets.QDialog):
         self.list_steps_edit.model().rowsMoved.connect(self.on_steps_reordered)
         side.addWidget(self.list_steps_edit)
 
+        b_retake = QtWidgets.QPushButton("選択したステップを撮り直す")
+        b_retake.clicked.connect(self.on_retake_clicked)
+        side.addWidget(with_help(
+            b_retake,
+            "一覧で選んだステップだけを、今の画面から撮り直して差し替えます。"
+            "ラベルや実行順はそのまま維持されます。旧方式(ccoeff)で記録した"
+            "既存レシピのうち、失敗しやすい一部のステップだけを新方式"
+            "(マスク付きZNCC)へ移行したいときに使います。押した後、対象の"
+            "ボタンが写るよう端末の画面を合わせてからクリックしてください。"))
+
         self.ck_popup_mode = QtWidgets.QCheckBox(
             "共通ポップアップとして記録\n(広告や「フレンド申請」等、順序を問わず割り込んだら閉じる用)")
         side.addWidget(with_help(
@@ -273,9 +288,11 @@ class RecorderDialog(QtWidgets.QDialog):
         side.addWidget(self.log, 1)
         root.addLayout(side)
 
-        self._load_existing()
+        self._load_existing(auto_continue=(retake_label is not None))
         self._refresh_lists()
         self.refresh()
+        if retake_label is not None:
+            self._arm_retake_by_label(retake_label)
 
     def _refresh_lists(self):
         self.list_steps_edit.blockSignals(True)
@@ -337,8 +354,12 @@ class RecorderDialog(QtWidgets.QDialog):
         else:
             item.setText(self.popups[idx]["label"])  # 空にはできない
 
-    def _load_existing(self):
-        """同名レシピが既にあれば、続きから記録するか確認して読み込む"""
+    def _load_existing(self, auto_continue=False):
+        """同名レシピが既にあれば、続きから記録するか確認して読み込む。
+
+        auto_continue=True(「失敗履歴」タブからの撮り直しショートカット起動時)
+        の場合は、続きから記録する意図が呼び出し元で既に明確なので、
+        確認ダイアログを出さず常に「続きから」を選んだものとして扱う"""
         recipe_file = self.dir / "recipe.json"
         if not recipe_file.exists():
             return
@@ -352,16 +373,19 @@ class RecorderDialog(QtWidgets.QDialog):
         if not prev_steps and not prev_popups:
             return
 
-        resp = QtWidgets.QMessageBox.question(
-            self, "既存レシピが見つかりました",
-            f"「{self.name}」には既に{len(prev_steps)}ステップ"
-            f"・{len(prev_popups)}件の共通ポップアップが記録されています。\n\n"
-            "「はい」: プログラムが止まった続きから追加記録する\n"
-            "「いいえ」: 最初からやり直す（「保存して閉じる」を押すまでは"
-            "元の記録は消えません。キャンセルすれば元のまま残ります）",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.Yes,
-        )
+        if auto_continue:
+            resp = QtWidgets.QMessageBox.Yes
+        else:
+            resp = QtWidgets.QMessageBox.question(
+                self, "既存レシピが見つかりました",
+                f"「{self.name}」には既に{len(prev_steps)}ステップ"
+                f"・{len(prev_popups)}件の共通ポップアップが記録されています。\n\n"
+                "「はい」: プログラムが止まった続きから追加記録する\n"
+                "「いいえ」: 最初からやり直す（「保存して閉じる」を押すまでは"
+                "元の記録は消えません。キャンセルすれば元のまま残ります）",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes,
+            )
         if resp == QtWidgets.QMessageBox.Yes:
             self.steps = prev_steps
             self.popups = prev_popups
@@ -443,16 +467,16 @@ class RecorderDialog(QtWidgets.QDialog):
         # 更新が終わったのでクリックを再度受け付ける
         self.img.setEnabled(True)
 
-    def on_click(self, lx, ly):
-        if self.pil is None:
-            return
-        self._dirty = True
-        rx = int(lx / self.scale)
-        ry = int(ly / self.scale)
+    def _capture_masked_template(self, rx, ry):
+        """クリック位置(rx, ry)を中心に複数フレーム撮影し、マスク付きZNCC用の
+        テンプレート・マスク・自動しきい値・確認用画像(ctx)を作る。
 
-        # マスク付きZNCC用に、時間を置いて複数枚撮影し「動かない画素」だけを
-        # 残したマスクを作る。端末にタップを送ると画面が進んでしまうため、
-        # この撮影は必ず「クリックを端末にも送る」の送信より前に行う
+        新規ステップ/共通ポップアップの記録と、既存ステップの撮り直しの
+        両方から呼ばれる共通処理(【撮り直し機能】追加にあたり on_click から
+        切り出した)。戻り値: (tpl_gray, mask, dx, dy, computed_threshold, ctx)
+        """
+        # 端末にタップを送ると画面が進んでしまうため、この撮影は必ず
+        # 「クリックを端末にも送る」の送信より前に行う
         self.img.setEnabled(False)
         self.setWindowTitle(f"記録: {self.name} (撮影中…)")
         self._msg("撮影中…(複数枚のスクリーンショットから動かない部分を抽出します)")
@@ -510,6 +534,50 @@ class RecorderDialog(QtWidgets.QDialog):
             f"  しきい値を自動算出: 最小一致度{min_score:.3f} - "
             f"{THRESHOLD_AUTO_MARGIN:.2f} = {computed_threshold:.3f} {clip_note}".rstrip())
 
+        if valid_ratio < MASK_MIN_VALID_RATIO:
+            self._msg(
+                f"  !! 注意: 動かない部分がほとんどありません(有効画素率"
+                f"{valid_ratio * 100:.1f}%)。暗転・読み込み画面などに誤反応しやすい"
+                "ので、文字や模様が入るよう「切抜き幅／高さ」を広げるか、"
+                "別の場所をクリックし直すことをおすすめします")
+        if transitioned:
+            self._msg(
+                "  !! 注意: 撮影中(約2秒)に画面が大きく変化しました。画面遷移の"
+                "途中で撮影してしまった可能性があるので、少し待ってから同じ場所を"
+                "撮り直すことをおすすめします")
+
+        return tpl_gray, mask, dx, dy, computed_threshold, ctx
+
+    def _dispatch_click_tap_and_refresh(self, rx, ry):
+        """「クリックを端末にも送る」がONならタップを送って画面更新を待ち、
+        OFFならすぐ画面を更新する(新規記録・撮り直し共通の末尾処理)"""
+        if self.ck_send.isChecked():
+            try:
+                core.tap(self.serial or self.d.serial, rx, ry)
+                self._msg("  端末にタップ送信 → 画面更新までクリック無効…")
+            except Exception as e:
+                self._msg(f"  !! タップ送信失敗: {e}")
+            # 更新が終わるまで誤クリック（古い画面での記録）を防ぐ
+            self.img.setEnabled(False)
+            QtCore.QTimer.singleShot(
+                int(self.sp_delay.value() * 1000), self.refresh)
+        else:
+            self.refresh()
+
+    def on_click(self, lx, ly):
+        if self.pil is None:
+            return
+        self._dirty = True
+        rx = int(lx / self.scale)
+        ry = int(ly / self.scale)
+
+        if self._retake_step is not None:
+            self._do_retake(rx, ry)
+            return
+
+        tpl_gray, mask, dx, dy, computed_threshold, ctx = \
+            self._capture_masked_template(rx, ry)
+
         if self.ck_popup_mode.isChecked():
             idx = len(self.popups) + 1
             tpl = f"popup_{idx:02d}.png"
@@ -540,31 +608,102 @@ class RecorderDialog(QtWidgets.QDialog):
             self.steps.append(new_item)
             self._history.append(("step", new_item))
             self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
-        if valid_ratio < MASK_MIN_VALID_RATIO:
-            self._msg(
-                f"  !! 注意: 動かない部分がほとんどありません(有効画素率"
-                f"{valid_ratio * 100:.1f}%)。暗転・読み込み画面などに誤反応しやすい"
-                "ので、文字や模様が入るよう「切抜き幅／高さ」を広げるか、"
-                "別の場所をクリックし直すことをおすすめします")
-        if transitioned:
-            self._msg(
-                "  !! 注意: 撮影中(約2秒)に画面が大きく変化しました。画面遷移の"
-                "途中で撮影してしまった可能性があるので、少し待ってから同じ場所を"
-                "撮り直すことをおすすめします")
         self._refresh_lists()
+        self._dispatch_click_tap_and_refresh(rx, ry)
 
-        if self.ck_send.isChecked():
-            try:
-                core.tap(self.serial or self.d.serial, rx, ry)
-                self._msg("  端末にタップ送信 → 画面更新までクリック無効…")
-            except Exception as e:
-                self._msg(f"  !! タップ送信失敗: {e}")
-            # 更新が終わるまで誤クリック（古い画面での記録）を防ぐ
-            self.img.setEnabled(False)
-            QtCore.QTimer.singleShot(
-                int(self.sp_delay.value() * 1000), self.refresh)
-        else:
+    def _find_step_index(self, step_obj):
+        """self.steps内でstep_objと同一のオブジェクト(is)を探し、そのインデックスを
+        返す。見つからなければ-1(並び替え・一つ戻す等で既に無くなっている場合)"""
+        for i, s in enumerate(self.steps):
+            if s is step_obj:
+                return i
+        return -1
+
+    def _arm_retake(self, idx):
+        """self.steps[idx]を撮り直し対象として選ぶ。次のon_clickで差し替えが
+        実行される"""
+        if not (0 <= idx < len(self.steps)):
+            return
+        if self._retake_step is not None:
+            self._msg(
+                "!! 既に撮り直し待ちのステップがあります。先にそのボタンを"
+                "クリックして撮影を完了するか、一覧から選び直してください")
+            return
+        self._retake_step = self.steps[idx]
+        label = self._retake_step["label"]
+        self.setWindowTitle(
+            f"記録: {self.name} ─ 「{label}」を撮り直し中(対象をクリック)")
+        self._msg(
+            f"「{label}」を撮り直します。対象のボタンが写るよう端末の画面を"
+            "合わせてから、そのボタンをクリックしてください"
+            "(新方式masked_znccで差し替えられます。順番・名前は維持されます)")
+
+    def _arm_retake_by_label(self, label):
+        """指定ラベルのステップを撮り直しモードにする(「失敗履歴」タブからの
+        ショートカット起動用)。見つからない場合(名前変更・削除等)は、
+        通常の記録ダイアログとして開いたままにし、その旨だけログに出す"""
+        for i, s in enumerate(self.steps):
+            if s.get("label") == label:
+                self.list_steps_edit.setCurrentRow(i)
+                self._arm_retake(i)
+                return
+        self._msg(
+            f"!! 「{label}」という名前のステップが見つかりませんでした"
+            "(名前が変更された可能性があります)。一覧から選び直してください")
+
+    def on_retake_clicked(self):
+        idx = self.list_steps_edit.currentRow()
+        if not (0 <= idx < len(self.steps)):
+            self._msg("!! 撮り直すステップを一覧から選択してください")
+            return
+        self._arm_retake(idx)
+
+    def _do_retake(self, rx, ry):
+        step = self._retake_step
+        self._retake_step = None
+        idx = self._find_step_index(step)
+        if idx < 0:
+            self._msg(
+                "!! 撮り直し対象のステップが見つかりません"
+                "(一つ戻す・並び替え等で変わった可能性があります)")
+            self.setWindowTitle(f"記録: {self.name}")
             self.refresh()
+            return
+
+        tpl_gray, mask, dx, dy, computed_threshold, ctx = \
+            self._capture_masked_template(rx, ry)
+
+        # 差し替え前の古いファイルは、保存されるまで削除しない
+        # (「最初からやり直す」の_purge_on_saveと同じ考え方に合流させる。
+        # 新しいファイルは別名で書き出すので、ここではまだ何も消さない)
+        if self._purge_on_save is None:
+            self._purge_on_save = set()
+        for fname in (step.get("template"), step.get("context"), step.get("mask")):
+            if fname:
+                self._purge_on_save.add(fname)
+
+        self._retake_seq += 1
+        tpl = f"step_{idx + 1:02d}_retake{self._retake_seq}.png"
+        ctx_name = f"context_{idx + 1:02d}_retake{self._retake_seq}.png"
+        mask_name = f"mask_{idx + 1:02d}_retake{self._retake_seq}.png"
+        core.imwrite(self.dir / tpl, tpl_gray)
+        core.imwrite(self.dir / mask_name, mask)
+        core.imwrite(self.dir / ctx_name, ctx)
+
+        # ラベル・実行順(リスト内の位置)は維持したまま、中身だけ差し替える
+        step["template"] = tpl
+        step["context"] = ctx_name
+        step["mask"] = mask_name
+        step["method"] = "masked_zncc"
+        step["threshold"] = computed_threshold
+        step["x"] = rx
+        step["y"] = ry
+        step["dx"] = dx
+        step["dy"] = dy
+
+        self._msg(f"「{step['label']}」を撮り直しました(新方式masked_znccに切替)")
+        self._refresh_lists()
+        self._dispatch_click_tap_and_refresh(rx, ry)
 
     def undo(self):
         if not self._history:
@@ -1219,6 +1358,14 @@ class MainWindow(QtWidgets.QWidget):
         self.tbl_rank.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.tbl_rank.setMaximumHeight(120)
         bl.addWidget(self.tbl_rank)
+        btn_retake_rank = QtWidgets.QPushButton("選択した項目を撮り直す(記録画面を開く)")
+        btn_retake_rank.clicked.connect(self.on_retake_from_rank)
+        bl.addWidget(with_help(
+            btn_retake_rank,
+            "選んだステップだけを撮り直すために、記録画面を開きます"
+            "(要: 端末接続)。上の「レシピ名」欄のレシピを続きから記録する"
+            "状態で開き、対象のステップが自動で撮り直し待ちになります。"
+            "端末に対象の画面を出してから、そのボタンをクリックしてください。"))
         fv.addLayout(groupbox_help(
             "過去の再生でどのステップが何回失敗したかを、失敗回数の多い順に"
             "表示します。よく失敗するステップは、しきい値や切り抜き画像を"
@@ -1304,7 +1451,7 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_conn.setEnabled(not busy)
         self.btn_stop.setEnabled(busy)
 
-    def on_record(self):
+    def on_record(self, *, retake_label=None):
         name = self.cmb_recipe.currentText().strip()
         if not name:
             self.append("!! レシピ名を入れてください")
@@ -1314,7 +1461,8 @@ class MainWindow(QtWidgets.QWidget):
             return
         try:
             dlg = RecorderDialog(self.serial, name,
-                                 self.sp_w.value(), self.sp_h.value(), self)
+                                 self.sp_w.value(), self.sp_h.value(), self,
+                                 retake_label=retake_label)
         except Exception as e:
             self.append(f"!! 記録の準備に失敗: {e}")
             return
@@ -1323,6 +1471,19 @@ class MainWindow(QtWidgets.QWidget):
         self.append(f"記録ウィンドウを閉じました（{name}）")
         if self.cmb_recipe.findText(name) < 0:
             self.cmb_recipe.addItem(name)
+
+    def on_retake_from_rank(self):
+        """「よく止まる箇所」ランキングで選んだ行のステップを、記録画面を
+        開いて直接撮り直しへ進める(【併せて】のショートカット)"""
+        row = self.tbl_rank.currentRow()
+        if row < 0:
+            self.append("!! 「よく止まる箇所」の一覧から撮り直したいステップを選択してください")
+            return
+        item = self.tbl_rank.item(row, 0)
+        label = item.text() if item else ""
+        if not label:
+            return
+        self.on_record(retake_label=label)
 
     def on_play(self):
         name = self.cmb_recipe.currentText().strip()
