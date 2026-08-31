@@ -249,20 +249,33 @@ def save_recipe(name, data):
     )
 
 
+def _load_step_images(d, step, label):
+    """テンプレート(と、あれば手法用のマスク)を読み込んで
+    step["_gray"]/step["_mask"] にセットする。
+
+    "method"キーを持たない古いレシピはccoeffとして扱い、マスクは
+    読み込まない(既存レシピの再生を壊さないため)"""
+    g = cv2.imread(str(d / step["template"]), cv2.IMREAD_GRAYSCALE)
+    if g is None:
+        raise FileNotFoundError(f"{label}のテンプレートが読めません: {step['template']}")
+    step["_gray"] = g
+    step.setdefault("method", "ccoeff")
+    mask_name = step.get("mask")
+    if mask_name:
+        m = cv2.imread(str(d / mask_name), cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            raise FileNotFoundError(f"{label}のマスクが読めません: {mask_name}")
+        step["_mask"] = m
+
+
 def load_recipe(name):
     d = recipe_path(name)
     data = json.loads((d / "recipe.json").read_text(encoding="utf-8"))
     for step in data["steps"]:
-        g = cv2.imread(str(d / step["template"]), cv2.IMREAD_GRAYSCALE)
-        if g is None:
-            raise FileNotFoundError(f"テンプレートが読めません: {step['template']}")
-        step["_gray"] = g
+        _load_step_images(d, step, "ステップ")
     data.setdefault("popups", [])
     for popup in data["popups"]:
-        g = cv2.imread(str(d / popup["template"]), cv2.IMREAD_GRAYSCALE)
-        if g is None:
-            raise FileNotFoundError(f"ポップアップのテンプレートが読めません: {popup['template']}")
-        popup["_gray"] = g
+        _load_step_images(d, popup, "ポップアップ")
     return data
 
 

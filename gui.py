@@ -149,6 +149,19 @@ class ReorderableListWidget(QtWidgets.QListWidget):
             self.dropping = False
 
 
+# マスク付きZNCC用: 連続撮影してマスクを作る際の設定値。
+# 値を変えたい場合はここを調整する
+MASK_CAPTURE_FRAMES = 6     # 撮影する枚数
+MASK_CAPTURE_INTERVAL = 0.3  # 撮影間隔(秒)
+MASK_STD_THRESHOLD = 8.0    # この標準偏差未満の画素だけを「動かない画素」としてマスクに含める
+MASK_MIN_VALID_RATIO = 0.05  # マスクの有効画素率がこれ未満なら警告
+# 撮影中に画面遷移してしまったこと(=別の画面を撮っていること)の検出しきい値。
+# 隣接フレーム間の平均輝度差(0-255スケール)がこれを超えたら「大きく変化した」とみなす。
+# クリック直後に画面遷移が始まるアプリでは、切り抜き範囲全体の色がガラッと
+# 変わることが多く、単純な平均差分でも実用上十分検出できるため
+MASK_TRANSITION_DIFF_THRESHOLD = 20.0
+
+
 # ============================================ 記録ダイアログ（クリック式）
 class RecorderDialog(QtWidgets.QDialog):
     def __init__(self, serial, name, tpl_w, tpl_h, parent=None):
@@ -363,7 +376,8 @@ class RecorderDialog(QtWidgets.QDialog):
             # ものだけを消す
             self._purge_on_save = set()
             for pattern in ("step_*.png", "context_*.png",
-                             "popup_*.png", "context_popup_*.png"):
+                             "popup_*.png", "context_popup_*.png",
+                             "mask_*.png", "mask_popup_*.png"):
                 for f in self.dir.glob(pattern):
                     self._purge_on_save.add(f.name)
             self._msg(
@@ -429,23 +443,63 @@ class RecorderDialog(QtWidgets.QDialog):
         self._dirty = True
         rx = int(lx / self.scale)
         ry = int(ly / self.scale)
-        ctx = cv2.cvtColor(np.array(self.pil), cv2.COLOR_RGB2BGR)
+
+        # マスク付きZNCC用に、時間を置いて複数枚撮影し「動かない画素」だけを
+        # 残したマスクを作る。端末にタップを送ると画面が進んでしまうため、
+        # この撮影は必ず「クリックを端末にも送る」の送信より前に行う
+        self.img.setEnabled(False)
+        self.setWindowTitle(f"記録: {self.name} (撮影中…)")
+        self._msg("撮影中…(複数枚のスクリーンショットから動かない部分を抽出します)")
+        QtWidgets.QApplication.processEvents()
+
+        frames = [self.pil]  # 直近のrefresh()で撮った画面を1枚目として使う
+        for _ in range(MASK_CAPTURE_FRAMES - 1):
+            time.sleep(MASK_CAPTURE_INTERVAL)
+            try:
+                frames.append(self.d.screenshot())
+            except Exception as e:
+                self._msg(f"!! 撮影中にスクショ失敗: {e}")
+                break
+        self.setWindowTitle(f"記録: {self.name}")
+
+        ctx = cv2.cvtColor(np.array(frames[0]), cv2.COLOR_RGB2BGR)
         cv2.rectangle(ctx,
                       (rx - self.tpl_w // 2, ry - self.tpl_h // 2),
                       (rx + self.tpl_w // 2, ry + self.tpl_h // 2),
                       (0, 0, 255), 4)
 
-        crop_img, (dx, dy) = core.crop(self.pil, rx, ry, self.tpl_w, self.tpl_h)
-        is_distinctive = core.is_distinctive(core.to_gray(crop_img))
+        dx = dy = 0
+        crops_gray = []
+        for f in frames:
+            crop_img, (dx, dy) = core.crop(f, rx, ry, self.tpl_w, self.tpl_h)
+            crops_gray.append(core.to_gray(crop_img).astype(np.float32))
+        stack = np.stack(crops_gray)
+        mask = (stack.std(axis=0) < MASK_STD_THRESHOLD).astype(np.uint8) * 255
+        tpl_gray = stack.mean(axis=0).astype(np.uint8)
+        valid_ratio = float((mask > 0).mean())
+
+        # 撮影中に画面遷移してしまった(=別の画面を撮ってしまった)ことの簡易検出。
+        # ページ遷移中は切り抜き範囲に限らず画面全体の絵が入れ替わるため、
+        # 隣接フレーム間で画面全体の平均輝度が大きく動くことが多い。これを
+        # 目安に「遷移中に撮ってしまった疑いがある」ことを検出する
+        full_grays = [core.to_gray(f).astype(np.float32) for f in frames]
+        transitioned = any(
+            abs(float(full_grays[i].mean()) - float(full_grays[i - 1].mean()))
+            > MASK_TRANSITION_DIFF_THRESHOLD
+            for i in range(1, len(full_grays))
+        )
 
         if self.ck_popup_mode.isChecked():
             idx = len(self.popups) + 1
             tpl = f"popup_{idx:02d}.png"
             ctx_name = f"context_popup_{idx:02d}.png"
-            crop_img.save(self.dir / tpl)
+            mask_name = f"mask_popup_{idx:02d}.png"
+            core.imwrite(self.dir / tpl, tpl_gray)
+            core.imwrite(self.dir / mask_name, mask)
             core.imwrite(self.dir / ctx_name, ctx)
             new_item = {"label": f"ポップアップ{idx}", "template": tpl,
-                        "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy}
+                        "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy,
+                        "method": "masked_zncc", "mask": mask_name}
             self.popups.append(new_item)
             self._history.append(("popup", new_item))
             self._msg(f"popup{idx}: ({rx},{ry}) → {tpl} (共通ポップアップとして記録)")
@@ -453,18 +507,27 @@ class RecorderDialog(QtWidgets.QDialog):
             idx = len(self.steps) + 1
             tpl = f"step_{idx:02d}.png"
             ctx_name = f"context_{idx:02d}.png"
-            crop_img.save(self.dir / tpl)
+            mask_name = f"mask_{idx:02d}.png"
+            core.imwrite(self.dir / tpl, tpl_gray)
+            core.imwrite(self.dir / mask_name, mask)
             core.imwrite(self.dir / ctx_name, ctx)
             new_item = {"label": f"タップ{idx}", "template": tpl,
-                        "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy}
+                        "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy,
+                        "method": "masked_zncc", "mask": mask_name}
             self.steps.append(new_item)
             self._history.append(("step", new_item))
             self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
-        if not is_distinctive:
+        if valid_ratio < MASK_MIN_VALID_RATIO:
             self._msg(
-                "  !! 注意: この画像はほぼ無地で情報量が少ないです。暗転・読み込み画面"
-                "などに誤反応しやすいので、文字や模様が入るよう「切抜き幅／高さ」を"
-                "広げるか、別の場所をクリックし直すことをおすすめします")
+                f"  !! 注意: 動かない部分がほとんどありません(有効画素率"
+                f"{valid_ratio * 100:.1f}%)。暗転・読み込み画面などに誤反応しやすい"
+                "ので、文字や模様が入るよう「切抜き幅／高さ」を広げるか、"
+                "別の場所をクリックし直すことをおすすめします")
+        if transitioned:
+            self._msg(
+                "  !! 注意: 撮影中(約2秒)に画面が大きく変化しました。画面遷移の"
+                "途中で撮影してしまった可能性があるので、少し待ってから同じ場所を"
+                "撮り直すことをおすすめします")
         self._refresh_lists()
 
         if self.ck_send.isChecked():
@@ -490,7 +553,7 @@ class RecorderDialog(QtWidgets.QDialog):
             target_list.remove(obj)
         except ValueError:
             pass  # 既に別の操作で消えている場合は何もしない
-        for fname in (obj.get("template"), obj.get("context")):
+        for fname in (obj.get("template"), obj.get("context"), obj.get("mask")):
             if fname:
                 try:
                     (self.dir / fname).unlink()
@@ -513,6 +576,7 @@ class RecorderDialog(QtWidgets.QDialog):
             for item in self.steps + self.popups:
                 keep.add(item.get("template"))
                 keep.add(item.get("context"))
+                keep.add(item.get("mask"))
             removed = 0
             for fname in self._purge_on_save:
                 if fname in keep:
