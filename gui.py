@@ -161,6 +161,12 @@ MASK_MIN_VALID_RATIO = 0.05  # マスクの有効画素率がこれ未満なら�
 # 変わることが多く、単純な平均差分でも実用上十分検出できるため
 MASK_TRANSITION_DIFF_THRESHOLD = 20.0
 
+# ステップごとのしきい値の自動算出用(フェーズ3)。撮影した6枚それぞれに対して
+# テンプレート＋マスクでマッチングし、その最小一致度からこの値を引いたものを
+# 初期しきい値とする。下限はTHRESHOLD_AUTO_MINでクリップする
+THRESHOLD_AUTO_MARGIN = 0.10
+THRESHOLD_AUTO_MIN = 0.5
+
 
 # ============================================ 記録ダイアログ（クリック式）
 class RecorderDialog(QtWidgets.QDialog):
@@ -489,6 +495,21 @@ class RecorderDialog(QtWidgets.QDialog):
             for i in range(1, len(full_grays))
         )
 
+        # ステップごとのしきい値を自動算出する。撮影した各フレームに対して
+        # 作ったテンプレート＋マスクでマッチングし、その最小一致度から
+        # マージン分を引いたものを初期値にする(=どのフレームでも確実に
+        # 拾えるよう、実際に観測した中で最も弱いスコアを基準にする)
+        scores = [core.match(g, tpl_gray, 0.0, method="masked_zncc", mask=mask)[2]
+                  for g in full_grays]
+        min_score = min(scores)
+        raw_threshold = min_score - THRESHOLD_AUTO_MARGIN
+        computed_threshold = max(THRESHOLD_AUTO_MIN, raw_threshold)
+        clip_note = (f"(下限{THRESHOLD_AUTO_MIN:.2f}でクリップ)"
+                     if computed_threshold > raw_threshold else "")
+        self._msg(
+            f"  しきい値を自動算出: 最小一致度{min_score:.3f} - "
+            f"{THRESHOLD_AUTO_MARGIN:.2f} = {computed_threshold:.3f} {clip_note}".rstrip())
+
         if self.ck_popup_mode.isChecked():
             idx = len(self.popups) + 1
             tpl = f"popup_{idx:02d}.png"
@@ -499,7 +520,8 @@ class RecorderDialog(QtWidgets.QDialog):
             core.imwrite(self.dir / ctx_name, ctx)
             new_item = {"label": f"ポップアップ{idx}", "template": tpl,
                         "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy,
-                        "method": "masked_zncc", "mask": mask_name}
+                        "method": "masked_zncc", "mask": mask_name,
+                        "threshold": computed_threshold}
             self.popups.append(new_item)
             self._history.append(("popup", new_item))
             self._msg(f"popup{idx}: ({rx},{ry}) → {tpl} (共通ポップアップとして記録)")
@@ -513,7 +535,8 @@ class RecorderDialog(QtWidgets.QDialog):
             core.imwrite(self.dir / ctx_name, ctx)
             new_item = {"label": f"タップ{idx}", "template": tpl,
                         "context": ctx_name, "x": rx, "y": ry, "dx": dx, "dy": dy,
-                        "method": "masked_zncc", "mask": mask_name}
+                        "method": "masked_zncc", "mask": mask_name,
+                        "threshold": computed_threshold}
             self.steps.append(new_item)
             self._history.append(("step", new_item))
             self._msg(f"step{idx}: ({rx},{ry}) → {tpl}")
@@ -606,14 +629,14 @@ class PlayerThread(QtCore.QThread):
     sig_cycle = QtCore.Signal(int, int)   # (成功, 失敗)
     sig_done = QtCore.Signal()
 
-    def __init__(self, serial, name, loops, threshold,
+    def __init__(self, serial, name, loops, threshold_offset,
                  step_timeout, after, poll, jitter, max_fail,
                  verify=True, tap_retry=3, hold_ms=0):
         super().__init__()
         self.serial = serial
         self.name = name
         self.loops = loops
-        self.threshold = threshold
+        self.threshold_offset = threshold_offset
         self.step_timeout = step_timeout
         self.after = after
         self.poll = poll
@@ -639,6 +662,19 @@ class PlayerThread(QtCore.QThread):
                 pass
         self.sig_log.emit(msg)
 
+    def _effective_threshold(self, step):
+        """そのステップで実際に使う一致しきい値を返す。
+
+        "threshold"キー(フェーズ3以降に記録したステップが持つ、記録時に
+        自動算出された基準値)があれば、それにGUIの調整値(offset)を足した
+        ものを使う。"threshold"キーを持たない(フェーズ2以前の)既存レシピの
+        ステップは、ステップごとの基準値が存在しないため、後方互換として
+        従来通りGUIの値をそのまま一致しきい値として使う"""
+        base = step.get("threshold")
+        if base is None:
+            return self.threshold_offset
+        return base + self.threshold_offset
+
     def _find_best_match(self, gray, candidates):
         """candidates のうち今の画面に写っているものを探す(一致度が最も高いものを返す)。
         戻り値は (candidates内でのインデックス, 候補dict, cx, cy, val) または
@@ -648,7 +684,7 @@ class PlayerThread(QtCore.QThread):
         for i, s in enumerate(candidates):
             if not core.is_distinctive(s["_gray"]):
                 continue
-            cx, cy, val = core.match(gray, s["_gray"], self.threshold)
+            cx, cy, val = core.match(gray, s["_gray"], self._effective_threshold(s))
             if cx is not None and (best is None or val > best[4]):
                 best = (i, s, cx, cy, val)
         return best
@@ -683,6 +719,7 @@ class PlayerThread(QtCore.QThread):
         import random
         step = all_steps[idx]
         later_steps = all_steps[idx + 1:]
+        thr = self._effective_threshold(step)
         deadline = time.time() + self.step_timeout
         best = 0.0
         last_report = time.time()
@@ -696,7 +733,7 @@ class PlayerThread(QtCore.QThread):
             if self._dismiss_popup_if_any(gray, popups):
                 continue
 
-            cx, cy, val = core.match(gray, step["_gray"], self.threshold)
+            cx, cy, val = core.match(gray, step["_gray"], thr)
             best = max(best, val)
 
             if cx is not None:
@@ -720,7 +757,7 @@ class PlayerThread(QtCore.QThread):
                     if self._dismiss_popup_if_any(after_gray, popups):
                         popup_interrupted = True
                         break
-                    ncx, ncy, nval = core.match(after_gray, step["_gray"], self.threshold)
+                    ncx, ncy, nval = core.match(after_gray, step["_gray"], thr)
                     if ncx is None:
                         return idx  # ボタンが消えた＝タップ成功、次へ
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
@@ -759,11 +796,11 @@ class PlayerThread(QtCore.QThread):
                 last_report = time.time()
                 self._log(
                     f"    待機中… {step['label']} 最高一致度 {best:.2f} "
-                    f"(しきい値 {self.threshold:.2f})")
+                    f"(しきい値 {thr:.2f})")
             time.sleep(self.poll)
 
         # タイムアウト → 最高一致度から原因を推定してヒントを出す
-        if best >= self.threshold - 0.05:
+        if best >= thr - 0.05:
             hint = "→ ほぼ一致。しきい値を少し下げれば拾えそう"
         elif best >= 0.6:
             hint = "→ 惜しい。切抜きを見直すか、しきい値を下げる"
@@ -790,6 +827,15 @@ class PlayerThread(QtCore.QThread):
                     "解像度・向きを合わせてください"
                 )
             popups = data.get("popups", [])
+            # ステップごとのしきい値("threshold"キー)を持たない旧形式のレシピが
+            # 1件でもあれば、GUIの調整欄の値域・初期値が変わっていることに
+            # よるユーザーの混乱を避けるため、その旨を1行ログに出しておく
+            if any("threshold" not in s for s in data["steps"] + popups):
+                self._log(
+                    "!! 注意: ステップごとのしきい値を持たない旧形式のレシピです。"
+                    f"「一致しきい値の調整（全体）」欄の値({self.threshold_offset:.2f})"
+                    "がそのまま一致しきい値として使われます。この欄は値域・初期値が"
+                    "変わっているので、検出しない/誤検出する場合は値を調整してください")
             self._log(f"再生開始: {len(data['steps'])}ステップ"
                       f"（共通ポップアップ{len(popups)}件） / "
                       f"{'無限' if self.loops == 0 else self.loops}周")
@@ -928,7 +974,10 @@ class MainWindow(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox("再生の設定")
         g = QtWidgets.QGridLayout(box)
         self.sp_loops = QtWidgets.QSpinBox(); self.sp_loops.setRange(0, 100000); self.sp_loops.setValue(0)
-        self.sp_thr = QtWidgets.QDoubleSpinBox(); self.sp_thr.setRange(0.5, 0.99); self.sp_thr.setSingleStep(0.01); self.sp_thr.setValue(0.85)
+        self.sp_thr_offset = QtWidgets.QDoubleSpinBox()
+        self.sp_thr_offset.setRange(-0.2, 0.2)
+        self.sp_thr_offset.setSingleStep(0.01)
+        self.sp_thr_offset.setValue(0.0)
         self.sp_to = QtWidgets.QSpinBox(); self.sp_to.setRange(5, 3600); self.sp_to.setValue(300)
         self.sp_after = QtWidgets.QDoubleSpinBox(); self.sp_after.setRange(0, 20); self.sp_after.setValue(1.2)
         self.sp_poll = QtWidgets.QDoubleSpinBox(); self.sp_poll.setRange(0.3, 10); self.sp_poll.setValue(1.5)
@@ -941,11 +990,15 @@ class MainWindow(QtWidgets.QWidget):
             "無限に繰り返します。"), 0, 0)
         g.addWidget(self.sp_loops, 0, 1)
         g.addWidget(help_label(
-            "一致しきい値",
-            "記録した画像とどれだけ似ていれば「見つかった」とみなすかの基準"
-            "(0〜1、高いほど厳密)。ボタンが見つからない場合は0.80、0.75のように"
-            "下げてみてください。ログに出る「最高一致度」が目安になります。"), 0, 2)
-        g.addWidget(self.sp_thr, 0, 3)
+            "一致しきい値の調整（全体）",
+            "各ステップのしきい値は記録時に自動算出されており、実際に使う"
+            "しきい値は「そのステップの基準値＋この調整値」です(-0.2〜+0.2)。"
+            "ボタンが見つからない場合はマイナス方向(-0.05, -0.10 など)に、"
+            "逆に別の場所を誤って検出してしまう場合はプラス方向に動かして"
+            "ください。ログに出る「しきい値」「最高一致度」が目安になります。"
+            "\n※ステップごとのしきい値を持たない古い形式のレシピでは、"
+            "この値がそのまま一致しきい値として使われます。"), 0, 2)
+        g.addWidget(self.sp_thr_offset, 0, 3)
         g.addWidget(help_label(
             "各ステップ最大待ち秒",
             "1つのステップの画像が現れるまで待つ最大時間(秒)。この時間を"
@@ -1178,7 +1231,7 @@ class MainWindow(QtWidgets.QWidget):
             return
         self.worker = PlayerThread(
             self.serial, name,
-            self.sp_loops.value(), self.sp_thr.value(),
+            self.sp_loops.value(), self.sp_thr_offset.value(),
             self.sp_to.value(), self.sp_after.value(),
             self.sp_poll.value(), self.sp_jitter.value(), self.sp_fail.value(),
             verify=self.ck_verify.isChecked(), tap_retry=3,
