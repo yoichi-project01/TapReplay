@@ -143,12 +143,83 @@ def crop(pil_img, cx, cy, w, h):
     return pil_img.crop((x1, y1, x1 + w, y1 + h)), (dx, dy)
 
 
-def match(screen_gray, tpl_gray, threshold):
-    """一致すれば (中心x, 中心y, 一致度)、しなければ (None, None, 一致度)"""
+# 手法ごとのしきい値の目安。しきい値の意味は手法ごとに全く異なるため、
+# 手法をまたいで使い回さないこと(呼び出し側でmethodに応じて選ぶ)。
+# フェーズ3でステップごとにしきい値を持たせる際の初期値として使う想定。
+DEFAULT_THRESHOLDS = {
+    "ccoeff": 0.85,       # 既存レシピ向け。TM_CCOEFF_NORMEDで全画面探索
+    "masked_zncc": 0.85,  # 半透明ボタン+アニメ背景など、mask指定時
+    "edge": 0.45,         # Cannyエッジベースのフォールバック
+}
+
+
+def masked_zncc(img_gray, tpl, mask):
+    """マスク内の画素だけで平均・分散を正規化した相関を全画面で計算する。
+
+    半透明ボタンやアニメーション背景など、テンプレートの一部の画素しか
+    毎フレーム安定していない場面で、その安定した部分(mask)だけを見て
+    位置を特定したいときに使う。マスク外の変動(背景アニメ等)に
+    引きずられて一致度が下がるのを防げる。
+
+    img_gray: 探索対象の画面(グレースケール)
+    tpl:      テンプレート画像(グレースケール、img_gray以下のサイズ)
+    mask:     tplと同じサイズ。0より大きい画素だけを判定に使う
+
+    戻り値はimg_grayに対するスコアマップ(cv2.matchTemplateの戻り値と
+    同じ形状: (H-h+1, W-w+1))。
+    """
+    I = img_gray.astype(np.float32)
+    T = tpl.astype(np.float32)
+    M = (mask > 0).astype(np.float32)
+    n = M.sum()
+    if n <= 0:
+        raise ValueError("masked_zncc: mask が全て0です(有効画素がありません)")
+    mT = (T * M).sum() / n
+    Tz = (T - mT) * M
+    denT = np.sqrt((Tz * Tz).sum())
+    if denT <= 0:
+        raise ValueError(
+            "masked_zncc: mask内のテンプレートがほぼ無地です(分散が0)")
+    sum_IT = cv2.matchTemplate(I, Tz, cv2.TM_CCORR)
+    sum_I  = cv2.matchTemplate(I, M,  cv2.TM_CCORR)
+    sum_I2 = cv2.matchTemplate(I * I, M, cv2.TM_CCORR)
+    varI = np.maximum(sum_I2 - (sum_I * sum_I) / n, 1e-6)
+    return sum_IT / (np.sqrt(varI) * denT)
+
+
+def match(screen_gray, tpl_gray, threshold, method="ccoeff", mask=None):
+    """一致すれば (中心x, 中心y, 一致度)、しなければ (None, None, 一致度)。
+
+    method:
+        "ccoeff"      - 既存方式。TM_CCOEFF_NORMEDで全画面探索(デフォルト、
+                        既存レシピはこのまま動く)
+        "masked_zncc" - 半透明ボタンなど、テンプレートの一部だけで判定
+                        したい場合に使う。mask(tpl_grayと同サイズ、
+                        0より大きい画素を有効とする)が必須
+        "edge"        - 画面・テンプレート双方にCanny(60,160)をかけてから
+                        TM_CCOEFF_NORMED。背景の色そのものの変化に
+                        左右されにくいフォールバック
+
+    しきい値の意味は手法ごとに異なるため(目安はDEFAULT_THRESHOLDSを参照)、
+    手法をまたいでしきい値を使い回さないこと。
+    """
     if (screen_gray.shape[0] < tpl_gray.shape[0] or
             screen_gray.shape[1] < tpl_gray.shape[1]):
         return None, None, 0.0
-    res = cv2.matchTemplate(screen_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+
+    if method == "ccoeff":
+        res = cv2.matchTemplate(screen_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+    elif method == "masked_zncc":
+        if mask is None:
+            raise ValueError("match: method='masked_zncc' には mask が必須です")
+        res = masked_zncc(screen_gray, tpl_gray, mask)
+    elif method == "edge":
+        screen_edge = cv2.Canny(screen_gray, 60, 160)
+        tpl_edge = cv2.Canny(tpl_gray, 60, 160)
+        res = cv2.matchTemplate(screen_edge, tpl_edge, cv2.TM_CCOEFF_NORMED)
+    else:
+        raise ValueError(f"match: 未知のmethodです: {method}")
+
     _, mx, _, loc = cv2.minMaxLoc(res)
     if mx < threshold:
         return None, None, mx
