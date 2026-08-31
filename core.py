@@ -171,7 +171,22 @@ DEFAULT_THRESHOLDS = {
 }
 
 
-def masked_zncc(img_gray, tpl, mask):
+MIN_LOCAL_STD = 2.0  # マスク内の局所標準偏差(グレー階調)がこれ未満なら絵柄無しとみなす
+
+# テンプレートのCannyエッジ画素がこの割合未満なら「エッジ手法では判定不能」とみなす。
+# 実測で確認した通り、テンプレート側のエッジ画素が0(=分散0)だと
+# cv2.matchTemplate(TM_CCOEFF_NORMED)は画面の内容に関わらず退化して
+# 常に1.0を返す(OpenCVの0/0特殊扱い)。これがedge:1.00という無意味な
+# 「常にマッチ」を生む原因だったため、評価前にテンプレート側で足切りする
+MIN_EDGE_RATIO = 0.01
+
+# match()の戻り値がこの範囲を超えて逸脱していたら、算出ロジックの不具合と
+# みなして例外にする(-1〜1に収まるはずの一致度が34.01のような値になって
+# いても素通りし、無関係な座標をタップし続けていた今回の不具合の再発防止)
+_SCORE_RANGE_TOLERANCE = 1e-3
+
+
+def masked_zncc(img_gray, tpl, mask, min_std=MIN_LOCAL_STD):
     """マスク内の画素だけで平均・分散を正規化した相関を全画面で計算する。
 
     半透明ボタンやアニメーション背景など、テンプレートの一部の画素しか
@@ -183,26 +198,36 @@ def masked_zncc(img_gray, tpl, mask):
     tpl:      テンプレート画像(グレースケール、img_gray以下のサイズ)
     mask:     tplと同じサイズ。0より大きい画素だけを判定に使う
 
+    絵柄の無い(局所標準偏差がmin_std未満の)一様な領域は評価対象から外す。
+    ZNCCはそうした領域で数学的に未定義であり、分散の引き算(sum_I2 -
+    sum_I**2/n)がfloat32の桁落ちでほぼ0や負になったところを小さい値で
+    割ってしまうと、わずかな数値誤差が数十倍に増幅されて-1〜1を超える
+    あり得ない値(誤検出の原因)になるため。
+
     戻り値はimg_grayに対するスコアマップ(cv2.matchTemplateの戻り値と
-    同じ形状: (H-h+1, W-w+1))。
+    同じ形状: (H-h+1, W-w+1))。値は必ず-1.0〜1.0にクリップされる。
     """
     I = img_gray.astype(np.float32)
+    I -= float(I.mean())  # 桁落ち対策(先に画像全体の平均を引いて値を小さくする)
     T = tpl.astype(np.float32)
     M = (mask > 0).astype(np.float32)
-    n = M.sum()
-    if n <= 0:
-        raise ValueError("masked_zncc: mask が全て0です(有効画素がありません)")
+    n = float(M.sum())
+    if n < 1:
+        raise ValueError("masked_zncc: マスクの有効画素が0です")
     mT = (T * M).sum() / n
     Tz = (T - mT) * M
-    denT = np.sqrt((Tz * Tz).sum())
-    if denT <= 0:
-        raise ValueError(
-            "masked_zncc: mask内のテンプレートがほぼ無地です(分散が0)")
+    denT = float(np.sqrt((Tz * Tz).sum()))
+    if denT < 1e-3:
+        raise ValueError("masked_zncc: テンプレートのマスク内に絵柄がありません")
     sum_IT = cv2.matchTemplate(I, Tz, cv2.TM_CCORR)
     sum_I  = cv2.matchTemplate(I, M,  cv2.TM_CCORR)
     sum_I2 = cv2.matchTemplate(I * I, M, cv2.TM_CCORR)
-    varI = np.maximum(sum_I2 - (sum_I * sum_I) / n, 1e-6)
-    return sum_IT / (np.sqrt(varI) * denT)
+    varI = sum_I2 - (sum_I * sum_I) / n
+    stdI = np.sqrt(np.maximum(varI, 0.0) / n)
+    res = np.zeros_like(sum_IT)
+    ok = stdI >= min_std
+    res[ok] = sum_IT[ok] / (np.sqrt(varI[ok]) * denT)
+    return np.clip(res, -1.0, 1.0)
 
 
 def match(screen_gray, tpl_gray, threshold, method="ccoeff", mask=None):
@@ -234,11 +259,20 @@ def match(screen_gray, tpl_gray, threshold, method="ccoeff", mask=None):
     elif method == "edge":
         screen_edge = cv2.Canny(screen_gray, 60, 160)
         tpl_edge = cv2.Canny(tpl_gray, 60, 160)
+        if np.count_nonzero(tpl_edge) / tpl_edge.size < MIN_EDGE_RATIO:
+            # テンプレートにエッジがほぼ無い→退化して常に1.0になるため、
+            # 「エッジ手法では判定できない」として未検出扱いにする
+            return None, None, 0.0
         res = cv2.matchTemplate(screen_edge, tpl_edge, cv2.TM_CCOEFF_NORMED)
     else:
         raise ValueError(f"match: 未知のmethodです: {method}")
 
     _, mx, _, loc = cv2.minMaxLoc(res)
+    if not (-1.0 - _SCORE_RANGE_TOLERANCE <= mx <= 1.0 + _SCORE_RANGE_TOLERANCE):
+        raise ValueError(
+            f"match: 一致度が想定範囲(-1〜1)外です(method={method}, 値={mx})。"
+            "算出ロジックに問題がある可能性があります")
+    mx = float(np.clip(mx, -1.0, 1.0))
     if mx < threshold:
         return None, None, mx
     h, w = tpl_gray.shape

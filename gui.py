@@ -1172,6 +1172,19 @@ class PlayerThread(QtCore.QThread):
                     f"「一致しきい値の調整（全体）」欄の値({self.threshold_offset:.2f})"
                     "がそのまま一致しきい値として使われます。この欄は値域・初期値が"
                     "変わっているので、検出しない/誤検出する場合は値を調整してください")
+            # 一致度は-1〜1に収まるはずなので、1.0を超えるthresholdは
+            # masked_zncc()の桁落ち不具合(修正済み)を前提に自動算出された
+            # 不正な値である可能性が高い。もう再現はしないが、既にそうした
+            # 値で記録されてしまった既存レシピを検出して知らせる
+            broken_labels = [
+                s.get("label", "?") for s in data["steps"] + popups
+                if s.get("threshold") is not None and s["threshold"] > 1.0
+            ]
+            if broken_labels:
+                self._log(
+                    "!! 注意: 以下のステップは不正なしきい値(1.0超)で記録されて"
+                    "います(過去の数値不具合が原因の可能性)。正しく検出できない"
+                    f"ため撮り直しをおすすめします: {', '.join(broken_labels)}")
             self._log(f"再生開始: {len(data['steps'])}ステップ"
                       f"（共通ポップアップ{len(popups)}件） / "
                       f"{'無限' if self.loops == 0 else self.loops}周")
