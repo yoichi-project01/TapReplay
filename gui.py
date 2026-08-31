@@ -191,6 +191,7 @@ class RecorderDialog(QtWidgets.QDialog):
         self._dirty = False  # 保存していない変更があるか(閉じる時の確認用)
         self.pil = None
         self.scale = 1.0
+        self.shot_w, self.shot_h = None, None  # refresh()で最新のスクショサイズに更新される
         # 撮り直し対象として選ばれているステップ(dict、self.stepsの要素そのもの)。
         # Noneでなければ、次のon_clickは新規ステップ追加ではなく撮り直しとして扱う
         self._retake_step = None
@@ -439,12 +440,17 @@ class RecorderDialog(QtWidgets.QDialog):
         except Exception as e:
             self._msg(f"!! スクショ失敗: {e}")
             return
+        # 表示スケールはスクリーンショット自体のサイズを基準にする(window_size
+        # ではない)。on_click()のrx,ryはこのスケールで逆算するため、ここを
+        # window_size基準のままにすると、shot_size!=window_sizeの端末で
+        # core.crop()に渡す座標(スクショ空間)とずれてしまう
+        self.shot_w, self.shot_h = self.pil.size
         avail = QtWidgets.QApplication.primaryScreen().availableGeometry()
         maxh = int(avail.height() * 0.85)
         maxw = int(avail.width() * 0.6)
-        self.scale = min(1.0, maxh / self.sh, maxw / self.sw)
+        self.scale = min(1.0, maxh / self.shot_h, maxw / self.shot_w)
         disp = self.pil.resize(
-            (int(self.sw * self.scale), int(self.sh * self.scale)))
+            (int(self.shot_w * self.scale), int(self.shot_h * self.scale)))
         pix = pil_to_qpix(disp)
         # 記録済みの位置に番号入りマーカーを描く(ステップ=赤, ポップアップ=青)
         painter = QtGui.QPainter(pix)
@@ -550,10 +556,15 @@ class RecorderDialog(QtWidgets.QDialog):
 
     def _dispatch_click_tap_and_refresh(self, rx, ry):
         """「クリックを端末にも送る」がONならタップを送って画面更新を待ち、
-        OFFならすぐ画面を更新する(新規記録・撮り直し共通の末尾処理)"""
+        OFFならすぐ画面を更新する(新規記録・撮り直し共通の末尾処理)。
+
+        rx, ryはスクリーンショット空間の座標。adb shell input tapは表示解像度
+        (window_size)で解釈されるため、端末へ送る直前にだけ変換する"""
         if self.ck_send.isChecked():
             try:
-                core.tap(self.serial or self.d.serial, rx, ry)
+                tx, ty = core.shot_to_window(
+                    rx, ry, self.shot_w, self.shot_h, self.sw, self.sh)
+                core.tap(self.serial or self.d.serial, tx, ty)
                 self._msg("  端末にタップ送信 → 画面更新までクリック無効…")
             except Exception as e:
                 self._msg(f"  !! タップ送信失敗: {e}")
@@ -753,6 +764,9 @@ class RecorderDialog(QtWidgets.QDialog):
             self._purge_on_save = None
         core.save_recipe(self.name, {
             "device_size": [self.sw, self.sh],
+            # スクショ空間で記録した座標(x/y/dx/dy)を再生側が正しく解釈できる
+            # ように、記録時のスクリーンショット解像度も保存しておく
+            "screenshot_size": [self.shot_w, self.shot_h],
             "popups": self.popups,
             "steps": self.steps,
         })
@@ -780,6 +794,14 @@ class PlayerThread(QtCore.QThread):
     # ため、まずは副作用の少ない間引きを採用した)
     POPUP_CHECK_INTERVAL = 1.0
 
+    # window_size空間への変換倍率(横×scale_x, 縦×scale_y)の相対差がこれを
+    # 超えたら「アスペクト比が違う」として警告する。ステータスバー分の数px
+    # の差やDPI丸めなど、良性の誤差は数%程度に収まることが多いのに対し、
+    # 縦横比が崩れる典型例(記録時と再生時で画面の向きが違う、解像度設定を
+    # 上書きした等)はscale_xとscale_yが数十%〜数倍単位で乖離するため、
+    # 誤検知と見逃しのバランスを見て15%に設定した
+    ASPECT_MISMATCH_THRESHOLD = 0.15
+
     def __init__(self, serial, name, loops, threshold_offset,
                  step_timeout, after, poll, jitter, max_fail,
                  verify=True, tap_retry=3, hold_ms=0):
@@ -803,6 +825,10 @@ class PlayerThread(QtCore.QThread):
         # 直近の失敗で「どの手法がどれだけ迫っていたか」を保持しておき、
         # failures.jsonlへの記録(【実装3】)に使う
         self._last_attempts = None
+        # 表示解像度(adb inputが解釈する座標系)。run()の冒頭でd.window_size()
+        # から設定される。タップ直前のスクショ空間→表示解像度変換に使う
+        self.sw = None
+        self.sh = None
 
     def stop(self):
         self._stop = True
@@ -816,6 +842,15 @@ class PlayerThread(QtCore.QThread):
             except Exception:
                 pass
         self.sig_log.emit(msg)
+
+    def _to_window(self, x, y, shot_shape):
+        """スクリーンショット空間の座標(x, y)を、実際にタップを送る直前に
+        表示解像度(self.sw, self.sh)空間へ変換する。shot_shapeはマッチング
+        に使ったグレースケール画像のshape((h, w))で、呼び出しごとの
+        スクリーンショットから直接求める(向き変更等にも追従できるように、
+        run()開始時の値を使い回さない)"""
+        shot_h, shot_w = shot_shape[:2]
+        return core.shot_to_window(x, y, shot_w, shot_h, self.sw, self.sh)
 
     def _effective_threshold(self, step):
         """そのステップで実際に使う一致しきい値を返す。
@@ -904,11 +939,13 @@ class PlayerThread(QtCore.QThread):
         _, popup, pcx, pcy, pval, pmethod, pthr, pattempts = hit
         jx = pcx + popup.get("dx", 0) + random.randint(-self.jitter, self.jitter)
         jy = pcy + popup.get("dy", 0) + random.randint(-self.jitter, self.jitter)
-        core.tap(self._serial, jx, jy, self.hold_ms)
+        tx, ty = self._to_window(jx, jy, gray.shape)
+        core.tap(self._serial, tx, ty, self.hold_ms)
         fallback_note = "(エッジ判定で検出)" if pmethod == "edge" else ""
         self._log(
             f"    !! 共通ポップアップ「{popup['label']}」を検知"
-            f"(一致{pval:.2f}[{pmethod}]){fallback_note}したので閉じました")
+            f"(一致{pval:.2f}[{pmethod}]){fallback_note}したので閉じました"
+            f" (タップ{tx},{ty})")
         time.sleep(self.after)
         return True
 
@@ -969,13 +1006,15 @@ class PlayerThread(QtCore.QThread):
                 # （背景アニメに惑わされない）
                 fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
                 popup_interrupted = False
+                cur_shape = gray.shape  # cx,cyがどのスクショ上の座標かを覚えておく
                 for attempt in range(1, self.tap_retry + 1):
                     jx = cx + step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
                     jy = cy + step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
-                    core.tap(self._serial, jx, jy, self.hold_ms)
+                    tx, ty = self._to_window(jx, jy, cur_shape)
+                    core.tap(self._serial, tx, ty, self.hold_ms)
                     tag = f" [{attempt}回目]" if attempt > 1 else ""
                     self._log(
-                        f"    {step['label']}: タップ({jx},{jy}) "
+                        f"    {step['label']}: タップ({tx},{ty}) "
                         f"一致{val:.2f}[{method_used}]{fallback_note}{tag}")
                     time.sleep(self.after)
                     if not self.verify:
@@ -997,6 +1036,7 @@ class PlayerThread(QtCore.QThread):
                         return idx  # ボタンが消えた＝タップ成功、次へ
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
                     cx, cy, method_used = ncx, ncy, nmethod
+                    cur_shape = after_gray.shape
                     fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
                     self._log(
                         f"    …まだボタンが残っています(一致{nval:.2f}[{nmethod}])。押し直します")
@@ -1019,7 +1059,8 @@ class PlayerThread(QtCore.QThread):
                 target_idx = idx + 1 + local_idx
                 jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
                 jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
-                core.tap(self._serial, jx, jy, self.hold_ms)
+                tx, ty = self._to_window(jx, jy, gray.shape)
+                core.tap(self._serial, tx, ty, self.hold_ms)
                 fallback_note = "(エッジ判定で検出)" if omethod == "edge" else ""
                 self._log(
                     f"    !! ステップ{idx + 1}「{step['label']}」をスキップして"
@@ -1061,12 +1102,66 @@ class PlayerThread(QtCore.QThread):
             d = core.connect(self.serial)
             self._serial = self.serial or d.serial
             data = core.load_recipe(self.name)
-            sw, sh = d.window_size()
-            if data.get("device_size") and list(data["device_size"]) != [sw, sh]:
+            self.sw, self.sh = d.window_size()
+            if data.get("device_size") and list(data["device_size"]) != [self.sw, self.sh]:
                 self._log(
                     f"!! 注意: 記録時({data['device_size']})と画面サイズが違います。"
                     "解像度・向きを合わせてください"
                 )
+
+            # 内部の座標(マッチング結果・dx/dy)はスクリーンショット空間で
+            # 統一しており、タップ直前にだけ表示解像度(self.sw, self.sh)へ
+            # 変換する(_to_window)。ここでは、その変換が信頼できる状況か
+            # どうかを再生開始前に確認しておく
+            try:
+                shot_w, shot_h = d.screenshot().size
+            except Exception as e:
+                shot_w = shot_h = None
+                self._log(f"!! 注意: 座標系確認用のスクリーンショット取得に失敗しました: {e}")
+
+            recorded_shot_size = data.get("screenshot_size")
+            if shot_w is not None:
+                if recorded_shot_size is not None:
+                    # 新形式: 記録時のスクショ解像度が分かっているので、
+                    # 今の解像度と直接比較できる
+                    if list(recorded_shot_size) != [shot_w, shot_h]:
+                        self._log(
+                            f"!! 注意: 記録時のスクリーンショット解像度"
+                            f"{tuple(recorded_shot_size)}と今の解像度"
+                            f"({shot_w},{shot_h})が違います。タップ位置が"
+                            "ずれる可能性があります")
+                else:
+                    # 旧形式("screenshot_size"を持たない): 記録時のスクショ
+                    # 解像度が分からないため直接比較はできない(スキップ)。
+                    # ただし旧形式のx/y/dx/dyは「window_size空間で記録した
+                    # つもりで、実際はスクショをwindow_size座標で切った」
+                    # 中途半端な値のため、記録時にスクショ解像度とwindow_size
+                    # が一致していた場合のみ正しく動く。それを後から確かめる
+                    # 手段はないが、今のこの端末で両者が一致していなければ、
+                    # 記録時も同様の食い違いだった可能性が高いとみなし、
+                    # 自動修復はせず再記録を促すだけに留める(挙動は変えない
+                    # ―― 一致していれば当時と同じ計算になり従来通り動く)
+                    if (shot_w, shot_h) != (self.sw, self.sh):
+                        self._log(
+                            "!! 注意: 座標系の情報を持たない旧形式のレシピで、"
+                            "かつ今の端末はスクリーンショット解像度と画面解像度が"
+                            "一致していません。このレシピは記録し直しが必要な"
+                            "可能性があります")
+
+                # 表示解像度への変換倍率(縦横別)が大きく異なる場合、スクショと
+                # 画面のアスペクト比が違う(向きの不一致など)ため、変換式
+                # そのものが信頼できない。旧形式・新形式を問わず今の端末の
+                # 状態そのものについての警告なので、常にチェックする
+                scale_x = self.sw / shot_w
+                scale_y = self.sh / shot_h
+                rel_diff = abs(scale_x - scale_y) / max(scale_x, scale_y)
+                if rel_diff > self.ASPECT_MISMATCH_THRESHOLD:
+                    self._log(
+                        f"!! 注意: 画面の縦横で表示解像度への倍率が大きく違います"
+                        f"(横×{scale_x:.2f} / 縦×{scale_y:.2f})。スクリーンショットと"
+                        "画面解像度のアスペクト比が違う(向きの不一致など)可能性が"
+                        "あり、タップ位置が信用できません")
+
             popups = data.get("popups", [])
             # ステップごとのしきい値("threshold"キー)を持たない旧形式のレシピが
             # 1件でもあれば、GUIの調整欄の値域・初期値が変わっていることに

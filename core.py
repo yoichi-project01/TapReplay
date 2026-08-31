@@ -87,6 +87,23 @@ def tap(serial, x, y, hold_ms=0):
                    capture_output=True, timeout=10)
 
 
+def shot_to_window(x, y, shot_w, shot_h, window_w, window_h):
+    """スクリーンショット空間の座標(x, y)を、adb shell input tap が解釈する
+    表示解像度(uiautomator2のwindow_size)空間の座標に変換する。
+
+    内部の座標(クリック位置・マッチング結果・dx/dy)はすべてスクリーン
+    ショット空間で統一し、端末へタップを実際に送る直前だけこれを通す
+    (screenshot()とwindow_size()のサイズが違う端末で、記録・再生位置が
+    ずれる不具合の修正)。倍率は縦横で別々に持つ(スクショと表示解像度の
+    アスペクト比が違う場合、一律の倍率では正しく変換できないため)。
+    """
+    if shot_w <= 0 or shot_h <= 0:
+        raise ValueError("shot_to_window: shot_w/shot_h は正の値である必要があります")
+    scale_x = window_w / shot_w
+    scale_y = window_h / shot_h
+    return int(round(x * scale_x)), int(round(y * scale_y))
+
+
 # ------------------------------------------------------- 画像マッチング
 def to_gray(pil_img):
     # 端末によってはスクリーンショットがRGBA(4チャンネル)で返ることがあり、
