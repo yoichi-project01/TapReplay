@@ -14,9 +14,9 @@ if errorlevel 1 (
 
 echo ビルドを開始します...
 
-REM  --onedir で作る（onefile より起動が速く、初回展開の待ちがない）
-REM  最初は --console のままにして、エラーが見えるようにしておく
-REM  安定したら --console を --windowed に変えるとコンソール窓が消える
+REM  ビルド設定はリポジトリ管理下のTapReplay.specに一本化している
+REM  (watch_build.ps1も同じspecを使う)。--onedir/アイコン/収集対象の
+REM  変更はコマンドラインではなくTapReplay.specを編集すること
 
 REM  PyInstaller は dist\TapReplay を丸ごと作り直すため、
 REM  記録済みレシピ(recipes\)を退避してビルド後に戻す
@@ -27,13 +27,7 @@ if exist "%RECIPES_DIR%" (
     move "%RECIPES_DIR%" "%BACKUP_DIR%" >nul
 )
 
-pyinstaller --noconfirm --onedir --console ^
-  --name TapReplay ^
-  --icon icon.ico ^
-  --collect-all uiautomator2 ^
-  --collect-all adbutils ^
-  --collect-all cv2 ^
-  gui.py
+pyinstaller --noconfirm TapReplay.spec
 
 REM  直後に退避しておかないと、この後のmoveコマンドの結果で
 REM  errorlevelが上書きされてしまい、pyinstallerの成否を判定できない
