@@ -11,10 +11,8 @@ GUI (gui.py) から呼ばれる。単体では起動しない。
     adb devices で端末が見えること
 """
 
-import re
 import sys
 import json
-import time
 import shutil
 import datetime
 import subprocess
@@ -87,119 +85,6 @@ def tap(serial, x, y, hold_ms=0):
         args = ("shell", "input", "tap", str(x), str(y))
     subprocess.run(adb_cmd(serial, *args),
                    capture_output=True, timeout=10)
-
-
-# ------------------------------------------------ タッチパネルの情報取得
-def find_touch_device(serial):
-    """
-    getevent -lp を解析して
-      (デバイスパス, X最大値, Y最大値)
-    を返す。見つからなければ (None, None, None)。
-    """
-    try:
-        out = subprocess.run(
-            adb_cmd(serial, "shell", "getevent", "-lp"),
-            capture_output=True, text=True, timeout=15
-        ).stdout
-    except Exception as e:
-        raise RuntimeError(f"getevent の実行に失敗しました: {e}")
-
-    cur = None
-    path = maxx = maxy = None
-    for line in out.splitlines():
-        m = re.search(r"add device \d+:\s*(\S+)", line)
-        if m:
-            cur = m.group(1)
-            continue
-        if ("ABS_MT_POSITION_X" in line) or ("ABS_X " in line):
-            mm = re.search(r"max\s+(\d+)", line)
-            if mm:
-                path, maxx = cur, int(mm.group(1))
-        elif ("ABS_MT_POSITION_Y" in line) or ("ABS_Y " in line):
-            mm = re.search(r"max\s+(\d+)", line)
-            if mm and cur == path:
-                maxy = int(mm.group(1))
-    return path, maxx, maxy
-
-
-def map_point(rx, ry, maxx, maxy, sw, sh, swap=False, invx=False, invy=False):
-    """生のタッチ座標を画面ピクセル座標へ変換する"""
-    if swap:
-        rx, ry = ry, rx
-        maxx, maxy = maxy, maxx
-    x = rx / maxx * sw if maxx else rx
-    y = ry / maxy * sh if maxy else ry
-    if invx:
-        x = sw - x
-    if invy:
-        y = sh - y
-    return int(round(x)), int(round(y))
-
-
-def auto_swap(maxx, maxy, sw, sh):
-    """パネルの向きと画面の向きが食い違うなら True"""
-    if not (maxx and maxy):
-        return False
-    return (maxx > maxy) != (sw > sh)
-
-
-# --------------------------------------------------- タッチイベント監視
-def iter_taps(serial, path, should_stop, on_proc=None, on_ready=None,
-              warmup=1.5, debounce=0.25):
-    """
-    端末のタップ開始を検出するたびに (raw_x, raw_y) を yield する
-    ジェネレータ。should_stop() が True になるか proc 終了で止まる。
-
-    getevent はプロセス起動から実際にイベントを流し始めるまで
-    わずかに遅れる。warmup 秒だけ待ってから on_ready() を呼び、
-    そのあとで監視を始めるので、最初のタップを取りこぼさない。
-    """
-    proc = subprocess.Popen(
-        adb_cmd(serial, "shell", "getevent", "-l", path),
-        stdout=subprocess.PIPE, text=True, bufsize=1
-    )
-    if on_proc:
-        on_proc(proc)
-    if warmup:
-        time.sleep(warmup)
-    if on_ready:
-        on_ready()
-
-    lastx = lasty = None
-    saw_btn = False
-    last_emit = 0.0
-    try:
-        for line in proc.stdout:
-            if should_stop():
-                break
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            code, val = parts[1], parts[2]
-
-            if code in ("ABS_MT_POSITION_X", "ABS_X"):
-                lastx = int(val, 16)
-            elif code in ("ABS_MT_POSITION_Y", "ABS_Y"):
-                lasty = int(val, 16)
-            elif code == "BTN_TOUCH":
-                saw_btn = True
-                if val == "DOWN" and lastx is not None and lasty is not None:
-                    now = time.time()
-                    if now - last_emit > debounce:
-                        last_emit = now
-                        yield lastx, lasty
-            elif code == "ABS_MT_TRACKING_ID" and not saw_btn:
-                # BTN_TOUCH を出さない端末向けフォールバック
-                if val.lower() != "ffffffff" and lastx is not None and lasty is not None:
-                    now = time.time()
-                    if now - last_emit > debounce:
-                        last_emit = now
-                        yield lastx, lasty
-    finally:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
 
 
 # ------------------------------------------------------- 画像マッチング
