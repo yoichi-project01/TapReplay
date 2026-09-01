@@ -67,7 +67,7 @@ pip install pyinstaller
 build.bat
 ```
 
-`dist/TapReplay/TapReplay.exe` が生成されます。`adb.exe`（platform-tools 一式）を同じフォルダに置くか、PATH を通してください。
+`dist/TapReplay/TapReplay.exe` が生成されます。`adb.exe` は同梱済みなので、`dist/TapReplay/` フォルダごと配布・実行すればそのまま動きます（フォルダの中身を分割せず、`_internal` フォルダも含めて丸ごと保ってください）。
 
 コードを変更するたびに `build.bat` を手動実行するのが面倒な場合は、`watch_build.bat` を開いたままにしておくと `core.py` / `gui.py` の保存を検知して自動で再ビルドしてくれます（詳細はウィンドウ内のログを参照）。
 

@@ -6,7 +6,8 @@ GUI (gui.py) から呼ばれる。単体では起動しない。
 依存:
     pip install uiautomator2 opencv-python numpy pillow
 前提:
-    Windows に platform-tools (adb.exe) を入れて PATH を通す
+    adb.exe は adbutils に同梱されているものを自動で使うため、別途
+    platform-tools を用意する必要はない(_resolve_adb()参照)
     端末: 開発者オプション → USB デバッグ ON
     adb devices で端末が見えること
 """
@@ -35,27 +36,44 @@ RECIPES.mkdir(exist_ok=True)
 def _resolve_adb():
     """
     使える adb.exe の場所を突き止める。
-    1) uiautomator2(adbutils) が使っている adb  ← 接続できているなら確実
-    2) PATH 上の adb
-    3) このツールと同じフォルダの adb.exe
+    1) exe化(PyInstaller onedir)されている場合、TapReplay.specの
+       collect_all('adbutils')で同梱したadbutils/binaries/adb.exeを直接指す。
+       adbutils.adb_path()は内部でimportlib.resourcesを使ってこのファイルを
+       探すが、PyInstallerの疑似importer環境ではこの解決がうまく働かない
+       ことがある(パッケージのソースがPYZアーカイブ内にあり、実ファイルの
+       サブフォルダと食い違うため)。onedir構成ではsys._MEIPASSが実行時に
+       exeと同じ階層に展開された実フォルダ(通常<exeのフォルダ>/_internal)
+       を指すため、そこから同梱物の実在するパスを直接組み立てる方が確実
+    2) uiautomator2(adbutils) が使っている adb(frozenでない通常実行時。
+       開発時の `python gui.py` ではこちらで解決できる)
+    3) PATH 上の adb
+    4) このツールと同じフォルダの adb.exe
+
+    戻り値: (adbの実行パス, 解決方法を表す短い説明。全滅した場合はNone)
     """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bundled = pathlib.Path(meipass) / "adbutils" / "binaries" / "adb.exe"
+            if bundled.exists():
+                return str(bundled), "exe同梱(adbutils)"
     try:
         import adbutils
         p = adbutils.adb_path()
         if p and pathlib.Path(str(p)).exists():
-            return str(p)
+            return str(p), "adbutils"
     except Exception:
         pass
     w = shutil.which("adb")
     if w:
-        return w
+        return w, "PATH"
     local = BASE / "adb.exe"
     if local.exists():
-        return str(local)
-    return "adb"
+        return str(local), "実行フォルダ"
+    return "adb", None
 
 
-ADB = _resolve_adb()
+ADB, ADB_SOURCE = _resolve_adb()
 
 
 # ------------------------------------------------------------------ 接続

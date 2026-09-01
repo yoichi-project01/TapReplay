@@ -48,7 +48,7 @@ if %BUILD_ERR% neq 0 (
 echo.
 echo 完成: dist\TapReplay\TapReplay.exe
 echo.
-echo 【重要】adb.exe を dist\TapReplay\ の中にコピーするか、
-echo         PATH を通しておいてください（platform-tools 一式）。
+echo dist\TapReplay\ フォルダごと配布すれば、そのまま動きます。
+echo （adb.exe は同梱済みです。手動でのコピーやPATH設定は不要です）
 echo.
 pause

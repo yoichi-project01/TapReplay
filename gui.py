@@ -1639,6 +1639,22 @@ class MainWindow(QtWidgets.QWidget):
         self.log.setReadOnly(True)
         v.addWidget(self.log, 1)
 
+        # 起動時にadbの解決結果を必ずログへ出す。実際に接続を試みるまで
+        # 気づけないと、この種の問題は切り分けに時間がかかるため
+        if core.ADB_SOURCE is None:
+            self.append(
+                "!! adb実行ファイルが見つかりません。端末に接続できません。"
+                "TapReplay.exeはdist\\TapReplayフォルダの中身(_internalフォルダ"
+                "含む)を丸ごと保った状態で配布・実行してください")
+            QtWidgets.QMessageBox.warning(
+                self, "adbが見つかりません",
+                "adb実行ファイルが見つからないため、端末に接続できません。\n\n"
+                "TapReplay.exe は dist\\TapReplay フォルダの中身(_internal フォルダ"
+                "含む)を丸ごと保った状態で配布・実行してください。exe単体だけを"
+                "別の場所へコピーすると、この状態になります。")
+        else:
+            self.append(f"adb: {core.ADB} ({core.ADB_SOURCE})")
+
     # ------------------------------------------------------------ 動作
     def append(self, msg):
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
