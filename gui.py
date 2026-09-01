@@ -779,7 +779,7 @@ class RecorderDialog(QtWidgets.QDialog):
 # ============================================================ 再生スレッド
 class PlayerThread(QtCore.QThread):
     sig_log = QtCore.Signal(str)
-    sig_cycle = QtCore.Signal(int, int)   # (成功, 失敗)
+    sig_cycle = QtCore.Signal(int, int, int)   # (成功, 失敗, 不完全)
     sig_done = QtCore.Signal()
 
     # 共通ポップアップの探索を間引く最小間隔(秒)。実測(1920x1080画面 x
@@ -801,6 +801,25 @@ class PlayerThread(QtCore.QThread):
     # 上書きした等)はscale_xとscale_yが数十%〜数倍単位で乖離するため、
     # 誤検知と見逃しのバランスを見て15%に設定した
     ASPECT_MISMATCH_THRESHOLD = 0.15
+
+    # スキップ機能(対象ステップが見つからない間に、レシピ内の後続ステップが
+    # 写っていないか探して復帰する仕組み)が、実機ログで無関係な離れた
+    # ステップに飛んで周回を破綻させる事例を確認したため、以下で絞り込む。
+    # - SKIP_SEARCH_RANGE: 「これより後」を無制限に探さず、直後何ステップ
+    #   までに限定する
+    # - SKIP_THRESHOLD_MARGIN: 誤って飛ぶコストが高いため、通常より
+    #   しきい値を厳しくする
+    SKIP_SEARCH_RANGE = 2
+    SKIP_THRESHOLD_MARGIN = 0.05
+
+    # タップ後の消失確認をポーリングする間隔(秒)と、打ち切るまでの上限
+    # (「タップ後待ち秒」の何倍か)。実機ログで、遷移アニメーションの途中を
+    # 1回だけ見て「まだ残っている」と誤判定し、無駄な押し直しが起きる事例
+    # (押した直後より一致度が上がっているケース)を確認したため、消えるまで
+    # (または上限まで)短い間隔で見続けるようにした。消えた時点で即座に
+    # 次へ進めるので、正常時はむしろ従来より速くなる
+    TAP_VERIFY_POLL_INTERVAL = 0.3
+    TAP_VERIFY_POLL_MAX_MULTIPLIER = 2.0
 
     def __init__(self, serial, name, loops, threshold_offset,
                  step_timeout, after, poll, jitter, max_fail,
@@ -972,18 +991,23 @@ class PlayerThread(QtCore.QThread):
     def _wait_and_tap(self, d, all_steps, idx, popups):
         """all_steps[idx] の画像が現れるまで待ってタップする。
 
-        見つからない間、レシピ内の"これより後の"ステップ画像が写っていない
-        かも探す。見つかればそれをタップし、再生位置をそこまで進める
-        (＝そのステップのインデックスを返す)。呼び出し元(run())は、
-        戻り値の次のインデックスから再開すること。
+        idx>=1の場合に限り、見つからない間、レシピ内の"これより後
+        (SKIP_SEARCH_RANGEステップ以内)"のステップ画像が写っていないかも
+        探す。見つかればそれをタップし、再生位置をそこまで進める。
+        idx==0(周回の最初のステップ)で見つからない場合はスキップしない。
+        周回の開始画面に居ないのは想定外の状態であり、飛び先を推測すると
+        全く無関係な場所に飛んで周回そのものが壊れるため(実機ログで
+        5ステップ中ステップ1→5に飛ぶ事例を確認)。
 
-        戻り値: 実際にタップできたステップのインデックス
-                (通常は idx 自身。この先のステップへ復帰した場合はそのインデックス)
+        戻り値: (実際にタップできたステップのインデックス, スキップしたか)
+                通常は (idx, False)。この先のステップへ復帰した場合は
+                (復帰先のインデックス, True)。呼び出し元(run())は、
+                戻り値の次のインデックスから再開し、スキップの有無で
+                その周を「成功」と数えるかを判断すること。
         タイムアウトした場合は TimeoutError を送出する。
         """
         import random
         step = all_steps[idx]
-        later_steps = all_steps[idx + 1:]
         deadline = time.time() + self.step_timeout
         # best_by_method: {手法名: (これまでの最高一致度, その時のしきい値)}。
         # 試した手法すべての最高値を残しておき、タイムアウト/失敗時の
@@ -1031,33 +1055,59 @@ class PlayerThread(QtCore.QThread):
                     self._log(
                         f"    {step['label']}: タップ({tx},{ty}) "
                         f"一致{val:.4f}[{method_used}]{fallback_note}{tag}")
-                    time.sleep(self.after)
+
                     if not self.verify:
-                        return idx
-                    after_gray = core.to_gray(d.screenshot())
-                    # ボタンが消えずに残っているように見えても、実は共通ポップアップに
-                    # 覆われていて反応していないだけ、というケースがあるため先に確認する
-                    # (タップ直後の確認は頻度が低いため間引かず毎回チェックする)
-                    if self._dismiss_popup_if_any(after_gray, popups):
-                        popup_interrupted = True
-                        break
-                    ncx, ncy, nval, nmethod, nthr, nattempts = self._match_candidate(
-                        after_gray, step)
-                    for m, v, t, pcx, pcy in nattempts:
-                        cur = best_by_method.get(m)
-                        if cur is None or v > cur[0]:
-                            best_by_method[m] = (v, t)
-                        if pcx is not None and (self._last_best_loc is None
-                                                 or v > self._last_best_loc[1]):
-                            self._last_best_loc = (m, v, pcx, pcy)
-                    if ncx is None:
-                        return idx  # ボタンが消えた＝タップ成功、次へ
+                        time.sleep(self.after)
+                        return idx, False
+
+                    # タップ後の消失確認は1回きりの判定にしない。押した直後は
+                    # 画面遷移アニメーションの途中であることが多く、そこだけ
+                    # 見ると「一致度が押す前より上がった(=まだ残っている)」と
+                    # 誤判定して無駄な押し直しが起きる(実機ログで確認)ため、
+                    # 短い間隔でポーリングして、消えた時点で即座に次へ進む。
+                    # ずっと見え続けた場合にだけ「効いていない」とみなす
+                    verify_start = time.time()
+                    verify_limit = self.after * self.TAP_VERIFY_POLL_MAX_MULTIPLIER
+                    gone = False
+                    while True:
+                        time.sleep(self.TAP_VERIFY_POLL_INTERVAL)
+                        after_gray = core.to_gray(d.screenshot())
+                        # ボタンが消えずに残っているように見えても、実は共通
+                        # ポップアップに覆われていて反応していないだけ、という
+                        # ケースがあるため先に確認する(頻度が低いため間引かない)
+                        if self._dismiss_popup_if_any(after_gray, popups):
+                            popup_interrupted = True
+                            break
+                        ncx, ncy, nval, nmethod, nthr, nattempts = self._match_candidate(
+                            after_gray, step)
+                        for m, v, t, pcx, pcy in nattempts:
+                            cur = best_by_method.get(m)
+                            if cur is None or v > cur[0]:
+                                best_by_method[m] = (v, t)
+                            if pcx is not None and (self._last_best_loc is None
+                                                     or v > self._last_best_loc[1]):
+                                self._last_best_loc = (m, v, pcx, pcy)
+                        if ncx is None:
+                            gone = True
+                            break
+                        cx, cy, method_used = ncx, ncy, nmethod
+                        cur_shape = after_gray.shape
+                        if time.time() - verify_start >= verify_limit:
+                            break
+
+                    if popup_interrupted:
+                        break  # forループを抜けてポップアップ対応へ
+
+                    elapsed = time.time() - verify_start
+                    if gone:
+                        self._log(f"    …消失確認: {elapsed:.1f}秒で消えました")
+                        return idx, False  # ボタンが消えた＝タップ成功、次へ
+
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
-                    cx, cy, method_used = ncx, ncy, nmethod
-                    cur_shape = after_gray.shape
                     fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
                     self._log(
-                        f"    …まだボタンが残っています(一致{nval:.4f}[{nmethod}])。押し直します")
+                        f"    …{elapsed:.1f}秒間ボタンが残っています"
+                        f"(一致{nval:.4f}[{nmethod}])。押し直します")
                 self._last_attempts = self._attempts_summary(best_by_method)
                 if popup_interrupted:
                     continue  # ポップアップを閉じたので対象を探し直す
@@ -1069,24 +1119,32 @@ class PlayerThread(QtCore.QThread):
                     "遷移しませんでした(同じ場所を押しても無反応)")
 
             # 対象の画像が見つからない → 想定外の画面(広告・確認ダイアログ等)の
-            # 可能性があるので、レシピ内の"これより後の"ステップ画像が
-            # 写っていないか探す(前のステップは対象にしない)
-            other = self._find_best_match(gray, later_steps)
-            if other is not None:
-                local_idx, other_step, ocx, ocy, oval, omethod, othr, oattempts = other
-                target_idx = idx + 1 + local_idx
-                jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
-                jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
-                tx, ty = self._to_window(jx, jy, gray.shape)
-                core.tap(self._serial, tx, ty, self.hold_ms)
-                fallback_note = "(エッジ判定で検出)" if omethod == "edge" else ""
-                self._log(
-                    f"    !! ステップ{idx + 1}「{step['label']}」をスキップして"
-                    f"ステップ{target_idx + 1}「{other_step['label']}」へ進みました"
-                    f"(この先の画像を検知・一致{oval:.4f}[{omethod}]){fallback_note}")
-                time.sleep(self.after)
-                # 元の対象を待ち続けても二度と現れないので、進んだ先から再開する
-                return target_idx
+            # 可能性があるので、レシピ内の"これより後"のステップ画像が
+            # 写っていないか探す(前のステップは対象にしない)。ただし
+            # idx==0(周回の最初)では発動しない(上のdocstring参照)
+            if idx > 0:
+                candidates = all_steps[idx + 1: idx + 1 + self.SKIP_SEARCH_RANGE]
+                other = self._find_best_match(gray, candidates)
+                if other is not None:
+                    local_idx, other_step, ocx, ocy, oval, omethod, othr, oattempts = other
+                    if oval < othr + self.SKIP_THRESHOLD_MARGIN:
+                        # 誤って飛ぶコストが高いため、通常よりしきい値を
+                        # 厳しくしている。それに届かなければスキップしない
+                        other = None
+                if other is not None:
+                    target_idx = idx + 1 + local_idx
+                    jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
+                    jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
+                    tx, ty = self._to_window(jx, jy, gray.shape)
+                    core.tap(self._serial, tx, ty, self.hold_ms)
+                    fallback_note = "(エッジ判定で検出)" if omethod == "edge" else ""
+                    self._log(
+                        f"    !! ステップ{idx + 1}「{step['label']}」をスキップして"
+                        f"ステップ{target_idx + 1}「{other_step['label']}」へ進みました"
+                        f"(この先の画像を検知・一致{oval:.4f}[{omethod}]){fallback_note}")
+                    time.sleep(self.after)
+                    # 元の対象を待ち続けても二度と現れないので、進んだ先から再開する
+                    return target_idx, True
 
             # まだ見つからない → 数秒おきに現在の一致度を報告
             if time.time() - last_report >= 3:
@@ -1207,7 +1265,7 @@ class PlayerThread(QtCore.QThread):
                       f"（共通ポップアップ{len(popups)}件） / "
                       f"{'無限' if self.loops == 0 else self.loops}周")
 
-            ok = ng_total = ng_streak = cycle = 0
+            ok = ng_total = ng_streak = cycle = incomplete = 0
             started = time.time()
             while self.loops == 0 or cycle < self.loops:
                 if self._stop:
@@ -1218,21 +1276,36 @@ class PlayerThread(QtCore.QThread):
                 try:
                     step_idx = 0
                     n_steps = len(data["steps"])
+                    skipped_this_cycle = False
                     while step_idx < n_steps:
                         current_step = data["steps"][step_idx]
-                        reached = self._wait_and_tap(d, data["steps"], step_idx, popups)
+                        reached, skipped = self._wait_and_tap(
+                            d, data["steps"], step_idx, popups)
+                        skipped_this_cycle = skipped_this_cycle or skipped
                         step_idx = reached + 1
-                    ok += 1
-                    ng_streak = 0  # 連続失敗カウントは成功したらリセット
-                    self.sig_cycle.emit(ok, ng_total)
                     avg = (time.time() - started) / cycle
-                    self._log(f"=== ループ {cycle} 完了  平均 {avg:.0f}秒/回 ===")
+                    if skipped_this_cycle:
+                        # スキップで途中のステップを飛ばした周は、実際には
+                        # 手順通りに動いたか確認できていないため「成功」に
+                        # 数えない(実機ログで、スキップにより5ステップ中
+                        # 1ステップしか実行していない周が「成功」として
+                        # 集計されてしまった事例を確認したため)
+                        incomplete += 1
+                        self.sig_cycle.emit(ok, ng_total, incomplete)
+                        self._log(
+                            f"=== ループ {cycle} 完了(スキップあり・不完全扱い) "
+                            f"平均 {avg:.0f}秒/回 ===")
+                    else:
+                        ok += 1
+                        ng_streak = 0  # 連続失敗カウントは成功したらリセット
+                        self.sig_cycle.emit(ok, ng_total, incomplete)
+                        self._log(f"=== ループ {cycle} 完了  平均 {avg:.0f}秒/回 ===")
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
                     ng_total += 1
                     ng_streak += 1
-                    self.sig_cycle.emit(ok, ng_total)
+                    self.sig_cycle.emit(ok, ng_total, incomplete)
                     self._log(f"!! ループ {cycle} 失敗: {e}")
                     # 参考情報: マスクの有効画素率と記録時に算出したしきい値。
                     # マスクがほとんど残っていないステップは、そもそも画像認識に
@@ -1284,7 +1357,8 @@ class PlayerThread(QtCore.QThread):
                 time.sleep(1)
 
             total = (time.time() - started) / 60
-            self._log(f"終了: 成功{ok} / 失敗{ng_total} / {total:.1f}分")
+            self._log(
+                f"終了: 成功{ok} / 失敗{ng_total} / 不完全{incomplete} / {total:.1f}分")
         except Exception as e:
             self._log(f"!! 再生エラー: {e}")
         finally:
@@ -1656,7 +1730,8 @@ class MainWindow(QtWidgets.QWidget):
         )
         self.worker.sig_log.connect(self.append)
         self.worker.sig_cycle.connect(
-            lambda ok, ng: self.lbl_stat.setText(f"成功 {ok} / 失敗 {ng}")
+            lambda ok, ng, incomplete: self.lbl_stat.setText(
+                f"成功 {ok} / 失敗 {ng} / 不完全 {incomplete}")
         )
         self.worker.sig_done.connect(self.on_worker_done)
         self._busy(True)
