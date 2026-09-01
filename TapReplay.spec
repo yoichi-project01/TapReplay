@@ -54,3 +54,9 @@ coll = COLLECT(
     upx_exclude=[],
     name='TapReplay',
 )
+# THIRD_PARTY_LICENSES.txt(同梱している第三者バイナリのライセンス表示)は、
+# ここでdatas/COLLECTに足す方式だとPyInstaller 6のインクリメンタルビルドで
+# 収録先が_internal配下になったり、そもそも収録されなかったりと実行のたびに
+# 結果が変わることを実機ビルドで確認した。exeと同じ最上位に確実に置くため、
+# build.bat / watch_build.ps1側でこのビルドの後にコピーする(スクリプトを
+# 参照)。ここでは追加しない

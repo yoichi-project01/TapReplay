@@ -29,6 +29,12 @@ function Invoke-Build {
 
     $ts = Get-Date -Format 'HH:mm:ss'
     if ($LASTEXITCODE -eq 0) {
+        # THIRD_PARTY_LICENSES.txt(同梱している第三者バイナリのライセンス表示)は
+        # specのdatas/COLLECT経由だとPyInstaller 6のインクリメンタルビルドで
+        # 収録先が_internal配下になったり収録されなかったりと不安定なため、
+        # ビルド後にここで確実にトップレベルへコピーする(build.batと同じ対応)
+        Copy-Item (Join-Path $root 'THIRD_PARTY_LICENSES.txt') `
+            (Join-Path $root 'dist\TapReplay\THIRD_PARTY_LICENSES.txt') -Force
         Write-Host "[$ts] ビルド完了 → dist\TapReplay\TapReplay.exe を更新しました" -ForegroundColor Green
     } else {
         Write-Host "[$ts] !! ビルド失敗（上のログを確認してください）" -ForegroundColor Red

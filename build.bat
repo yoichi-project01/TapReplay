@@ -45,6 +45,12 @@ if %BUILD_ERR% neq 0 (
     exit /b 1
 )
 
+REM  THIRD_PARTY_LICENSES.txt(同梱している第三者バイナリのライセンス表示)は
+REM  specのdatas/COLLECT経由だとPyInstaller 6のインクリメンタルビルドで
+REM  収録先が_internal配下になったり収録されなかったりと不安定なため、
+REM  ビルド後にここで確実にトップレベルへコピーする
+copy /y "%~dp0THIRD_PARTY_LICENSES.txt" "%~dp0dist\TapReplay\THIRD_PARTY_LICENSES.txt" >nul
+
 echo.
 echo 完成: dist\TapReplay\TapReplay.exe
 echo.

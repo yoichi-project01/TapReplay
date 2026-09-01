@@ -82,11 +82,21 @@ build.bat
 | `TapReplay.spec` | PyInstaller のビルド設定 |
 | `icon.ico` | exe のアイコン |
 | `requirements.txt` | 依存ライブラリ |
+| `THIRD_PARTY_LICENSES.txt` | 同梱している第三者コンポーネントのライセンス表示 |
 | `recipes/` | 記録したレシピ（自動生成） |
 
 ## ライセンス
 
 MIT License（`LICENSE` を参照）
+
+## 同梱している第三者コンポーネントとそのライセンス
+
+`dist/TapReplay/TapReplay.exe` には、端末操作に使う `adb.exe` / `AdbWinApi.dll` /
+`AdbWinUsbApi.dll`（Android SDK Platform-Tools 由来、Apache License 2.0）や、
+PySide6・opencv-python・uiautomator2・adbutils・numpy・Pillow などの Python
+依存パッケージが同梱されています。それぞれのライセンス表示は
+`THIRD_PARTY_LICENSES.txt`（`dist/TapReplay/` 直下にも同梱）にまとめています。
+TapReplay 本体のソースコード自体は引き続き MIT License です。
 
 ## 免責・利用上の注意
 
