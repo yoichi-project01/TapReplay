@@ -825,6 +825,11 @@ class PlayerThread(QtCore.QThread):
         # 直近の失敗で「どの手法がどれだけ迫っていたか」を保持しておき、
         # failures.jsonlへの記録(【実装3】)に使う
         self._last_attempts = None
+        # 診断用: 直近のステップ待ちで最も一致した位置(method, val, cx, cy)と、
+        # 実際にタップした座標(cx, cy)。どちらもスクリーンショット空間。
+        # 失敗時のスクリーンショットへの位置描画に使う
+        self._last_best_loc = None
+        self._last_tapped_pos = None
         # 表示解像度(adb inputが解釈する座標系)。run()の冒頭でd.window_size()
         # から設定される。タップ直前のスクショ空間→表示解像度変換に使う
         self.sw = None
@@ -892,28 +897,32 @@ class PlayerThread(QtCore.QThread):
               検出できた手法("edge"ならフォールバックで見つかったことを示す)
             - 見つからなかった場合: cx=cy=None。method_used/thr_usedは
               主手法(candの"method")のもの
-            - attempts: [(method, val, threshold), ...] 試した手法すべての
-              記録(ログ・failures.jsonl用)
+            - attempts: [(method, val, threshold, peak_cx, peak_cy), ...]
+              試した手法すべての記録(ログ・failures.jsonl用)。peak_cx/cyは
+              しきい値に関わらない最も一致した位置(診断用、失敗時の
+              スクリーンショットへの位置描画に使う。該当なしならNone)
         """
         method = cand.get("method", "ccoeff")
         thr = self._effective_threshold(cand)
         mask = cand.get("_mask") if method == "masked_zncc" else None
-        cx, cy, val = core.match(gray, cand["_gray"], thr, method=method, mask=mask)
-        attempts = [(method, val, thr)]
-        if cx is not None:
-            return cx, cy, val, method, thr, attempts
+        pcx, pcy, val = core.peak_match(gray, cand["_gray"], method=method, mask=mask)
+        found = pcx is not None and val >= thr
+        attempts = [(method, val, thr, pcx, pcy)]
+        if found:
+            return pcx, pcy, val, method, thr, attempts
         if method == "masked_zncc":
             edge_thr = self._effective_threshold_edge(cand)
-            ecx, ecy, eval_ = core.match(gray, cand["_gray"], edge_thr, method="edge")
-            attempts.append(("edge", eval_, edge_thr))
-            if ecx is not None:
+            ecx, ecy, eval_ = core.peak_match(gray, cand["_gray"], method="edge")
+            edge_found = ecx is not None and eval_ >= edge_thr
+            attempts.append(("edge", eval_, edge_thr, ecx, ecy))
+            if edge_found:
                 return ecx, ecy, eval_, "edge", edge_thr, attempts
         return None, None, val, method, thr, attempts
 
     def _attempts_summary(self, best_by_method):
         """{手法名: (最高一致度, しきい値)} を failures.jsonl 用のJSON化しやすい
         リスト形式に変換する(【実装3】)"""
-        return [{"method": m, "score": round(float(v), 3), "threshold": round(float(t), 3)}
+        return [{"method": m, "score": round(float(v), 4), "threshold": round(float(t), 4)}
                 for m, (v, t) in best_by_method.items()]
 
     def _find_best_match(self, gray, candidates):
@@ -944,7 +953,7 @@ class PlayerThread(QtCore.QThread):
         fallback_note = "(エッジ判定で検出)" if pmethod == "edge" else ""
         self._log(
             f"    !! 共通ポップアップ「{popup['label']}」を検知"
-            f"(一致{pval:.2f}[{pmethod}]){fallback_note}したので閉じました"
+            f"(一致{pval:.4f}[{pmethod}]){fallback_note}したので閉じました"
             f" (タップ{tx},{ty})")
         time.sleep(self.after)
         return True
@@ -981,6 +990,8 @@ class PlayerThread(QtCore.QThread):
         # ヒント表示とfailures.jsonlへの記録(【実装3】)に使う
         best_by_method = {}
         self._last_attempts = None
+        self._last_best_loc = None
+        self._last_tapped_pos = None
         last_report = time.time()
         while time.time() < deadline:
             if self._stop:
@@ -994,10 +1005,13 @@ class PlayerThread(QtCore.QThread):
                 continue
 
             cx, cy, val, method_used, thr_used, attempts = self._match_candidate(gray, step)
-            for m, v, t in attempts:
+            for m, v, t, pcx, pcy in attempts:
                 cur = best_by_method.get(m)
                 if cur is None or v > cur[0]:
                     best_by_method[m] = (v, t)
+                if pcx is not None and (self._last_best_loc is None
+                                         or v > self._last_best_loc[1]):
+                    self._last_best_loc = (m, v, pcx, pcy)
             self._last_attempts = self._attempts_summary(best_by_method)
 
             if cx is not None:
@@ -1010,12 +1024,13 @@ class PlayerThread(QtCore.QThread):
                 for attempt in range(1, self.tap_retry + 1):
                     jx = cx + step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
                     jy = cy + step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
+                    self._last_tapped_pos = (jx, jy)  # スクリーンショット空間で記録(診断用)
                     tx, ty = self._to_window(jx, jy, cur_shape)
                     core.tap(self._serial, tx, ty, self.hold_ms)
                     tag = f" [{attempt}回目]" if attempt > 1 else ""
                     self._log(
                         f"    {step['label']}: タップ({tx},{ty}) "
-                        f"一致{val:.2f}[{method_used}]{fallback_note}{tag}")
+                        f"一致{val:.4f}[{method_used}]{fallback_note}{tag}")
                     time.sleep(self.after)
                     if not self.verify:
                         return idx
@@ -1028,10 +1043,13 @@ class PlayerThread(QtCore.QThread):
                         break
                     ncx, ncy, nval, nmethod, nthr, nattempts = self._match_candidate(
                         after_gray, step)
-                    for m, v, t in nattempts:
+                    for m, v, t, pcx, pcy in nattempts:
                         cur = best_by_method.get(m)
                         if cur is None or v > cur[0]:
                             best_by_method[m] = (v, t)
+                        if pcx is not None and (self._last_best_loc is None
+                                                 or v > self._last_best_loc[1]):
+                            self._last_best_loc = (m, v, pcx, pcy)
                     if ncx is None:
                         return idx  # ボタンが消えた＝タップ成功、次へ
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
@@ -1039,7 +1057,7 @@ class PlayerThread(QtCore.QThread):
                     cur_shape = after_gray.shape
                     fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
                     self._log(
-                        f"    …まだボタンが残っています(一致{nval:.2f}[{nmethod}])。押し直します")
+                        f"    …まだボタンが残っています(一致{nval:.4f}[{nmethod}])。押し直します")
                 self._last_attempts = self._attempts_summary(best_by_method)
                 if popup_interrupted:
                     continue  # ポップアップを閉じたので対象を探し直す
@@ -1065,7 +1083,7 @@ class PlayerThread(QtCore.QThread):
                 self._log(
                     f"    !! ステップ{idx + 1}「{step['label']}」をスキップして"
                     f"ステップ{target_idx + 1}「{other_step['label']}」へ進みました"
-                    f"(この先の画像を検知・一致{oval:.2f}[{omethod}]){fallback_note}")
+                    f"(この先の画像を検知・一致{oval:.4f}[{omethod}]){fallback_note}")
                 time.sleep(self.after)
                 # 元の対象を待ち続けても二度と現れないので、進んだ先から再開する
                 return target_idx
@@ -1074,7 +1092,7 @@ class PlayerThread(QtCore.QThread):
             if time.time() - last_report >= 3:
                 last_report = time.time()
                 detail = " / ".join(
-                    f"{m}:{v:.2f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
+                    f"{m}:{v:.4f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
                 self._log(f"    待機中… {step['label']} 最高一致度 {detail}")
             time.sleep(self.poll)
 
@@ -1088,7 +1106,7 @@ class PlayerThread(QtCore.QThread):
         else:
             hint = "→ この画面に対象が無い。前のタップが効いていない可能性大"
         detail = " / ".join(
-            f"{m}:{v:.2f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
+            f"{m}:{v:.4f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
         raise TimeoutError(f"{step['label']} が出現せず ({detail}) {hint}")
 
     def run(self):
@@ -1216,12 +1234,39 @@ class PlayerThread(QtCore.QThread):
                     ng_streak += 1
                     self.sig_cycle.emit(ok, ng_total)
                     self._log(f"!! ループ {cycle} 失敗: {e}")
+                    # 参考情報: マスクの有効画素率と記録時に算出したしきい値。
+                    # マスクがほとんど残っていないステップは、そもそも画像認識に
+                    # 向いていないことが多いため、原因の見当をつけやすくする
+                    if current_step is not None:
+                        mask_arr = current_step.get("_mask")
+                        if mask_arr is not None:
+                            valid_ratio = float((mask_arr > 0).mean())
+                            self._log(f"    参考: マスク有効画素率 {valid_ratio * 100:.1f}%")
+                        ref_thr = current_step.get("threshold")
+                        if ref_thr is not None:
+                            self._log(f"    参考: 記録時に算出したしきい値 {ref_thr:.4f}")
                     # 失敗の記録自体が失敗しても(端末との接続切れ等)再生は止めない
                     try:
                         safe_reason = "".join(
                             c if c.isalnum() else "_" for c in str(e))[:40]
                         fname = f"error_{datetime.datetime.now():%H%M%S}_{safe_reason}.png"
-                        core.imwrite(recipe_dir / fname, core.to_bgr(d.screenshot()))
+                        img = core.to_bgr(d.screenshot())
+                        if current_step is not None:
+                            # 失敗時のスクショに、最も一致した位置(赤)・記録上の
+                            # タップ位置(緑)・実際にタップした位置(黄)を描き込む。
+                            # 「正しい場所にマッチしているのにタップが効かない」のか
+                            # 「そもそも無関係な場所にマッチしている」のかを一目で
+                            # 切り分けられるようにするため
+                            recorded_pos = None
+                            if (current_step.get("x") is not None
+                                    and current_step.get("y") is not None):
+                                recorded_pos = (current_step["x"], current_step["y"])
+                            img = core.annotate_diagnostic(
+                                img, current_step["_gray"].shape,
+                                best_loc=self._last_best_loc,
+                                recorded_pos=recorded_pos,
+                                tapped_pos=self._last_tapped_pos)
+                        core.imwrite(recipe_dir / fname, img)
                         step_label = current_step["label"] if current_step else "?"
                         core.append_failure(self.name, step_label, str(e), fname,
                                              attempts=self._last_attempts)
@@ -1768,7 +1813,7 @@ class MainWindow(QtWidgets.QWidget):
             attempts = f.get("attempts")
             if attempts:
                 summary = " / ".join(
-                    f"{a.get('method', '?')}:{a.get('score', 0):.2f}" for a in attempts)
+                    f"{a.get('method', '?')}:{a.get('score', 0):.4f}" for a in attempts)
                 text += f"  [{summary}]"
             item = QtWidgets.QListWidgetItem(text)
             item.setData(QtCore.Qt.UserRole, f.get("screenshot"))

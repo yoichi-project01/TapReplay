@@ -227,24 +227,25 @@ def masked_zncc(img_gray, tpl, mask, min_std=MIN_LOCAL_STD):
     res = np.zeros_like(sum_IT)
     ok = stdI >= min_std
     res[ok] = sum_IT[ok] / (np.sqrt(varI[ok]) * denT)
+    # クリップは微小な浮動小数点誤差を吸収するためのもの。それを超える逸脱は
+    # 算出ロジックの不具合なので、丸めて隠さずここで検出する
+    # (match()側のレンジチェックはクリップ後の値しか見えず、ここで発散して
+    # いてもクリップ後は1.00に丸まって素通りしてしまうため、クリップ前の
+    # ここで検証する)
+    peak = float(np.abs(res).max())
+    if peak > 1.0 + _SCORE_RANGE_TOLERANCE:
+        raise ValueError(f"masked_zncc: 一致度が想定範囲外です(最大絶対値={peak})")
     return np.clip(res, -1.0, 1.0)
 
 
-def match(screen_gray, tpl_gray, threshold, method="ccoeff", mask=None):
-    """一致すれば (中心x, 中心y, 一致度)、しなければ (None, None, 一致度)。
+def peak_match(screen_gray, tpl_gray, method="ccoeff", mask=None):
+    """screen_gray全体をmethodで探索し、しきい値に関わらず最も一致した
+    位置(中心x, 中心y)とその一致度を返す(見つからない条件でも位置と
+    値は返す。テンプレートがscreenより大きい等で計算不能な場合のみ
+    (None, None, 0.0))。
 
-    method:
-        "ccoeff"      - 既存方式。TM_CCOEFF_NORMEDで全画面探索(デフォルト、
-                        既存レシピはこのまま動く)
-        "masked_zncc" - 半透明ボタンなど、テンプレートの一部だけで判定
-                        したい場合に使う。mask(tpl_grayと同サイズ、
-                        0より大きい画素を有効とする)が必須
-        "edge"        - 画面・テンプレート双方にCanny(60,160)をかけてから
-                        TM_CCOEFF_NORMED。背景の色そのものの変化に
-                        左右されにくいフォールバック
-
-    しきい値の意味は手法ごとに異なるため(目安はDEFAULT_THRESHOLDSを参照)、
-    手法をまたいでしきい値を使い回さないこと。
+    match()の中身そのものだが、しきい値による絞り込みをしないぶん、
+    診断用途(失敗時のスクリーンショットへの位置描画など)にも使える。
     """
     if (screen_gray.shape[0] < tpl_gray.shape[0] or
             screen_gray.shape[1] < tpl_gray.shape[1]):
@@ -273,10 +274,69 @@ def match(screen_gray, tpl_gray, threshold, method="ccoeff", mask=None):
             f"match: 一致度が想定範囲(-1〜1)外です(method={method}, 値={mx})。"
             "算出ロジックに問題がある可能性があります")
     mx = float(np.clip(mx, -1.0, 1.0))
-    if mx < threshold:
-        return None, None, mx
     h, w = tpl_gray.shape
     return loc[0] + w // 2, loc[1] + h // 2, mx
+
+
+def match(screen_gray, tpl_gray, threshold, method="ccoeff", mask=None):
+    """一致すれば (中心x, 中心y, 一致度)、しなければ (None, None, 一致度)。
+
+    method:
+        "ccoeff"      - 既存方式。TM_CCOEFF_NORMEDで全画面探索(デフォルト、
+                        既存レシピはこのまま動く)
+        "masked_zncc" - 半透明ボタンなど、テンプレートの一部だけで判定
+                        したい場合に使う。mask(tpl_grayと同サイズ、
+                        0より大きい画素を有効とする)が必須
+        "edge"        - 画面・テンプレート双方にCanny(60,160)をかけてから
+                        TM_CCOEFF_NORMED。背景の色そのものの変化に
+                        左右されにくいフォールバック
+
+    しきい値の意味は手法ごとに異なるため(目安はDEFAULT_THRESHOLDSを参照)、
+    手法をまたいでしきい値を使い回さないこと。
+    """
+    cx, cy, mx = peak_match(screen_gray, tpl_gray, method=method, mask=mask)
+    if cx is None or mx < threshold:
+        return None, None, mx
+    return cx, cy, mx
+
+
+def annotate_diagnostic(img_bgr, tpl_shape, best_loc=None, recorded_pos=None,
+                         tapped_pos=None):
+    """失敗時のスクリーンショット(BGR)に診断用の情報を描き込んだコピーを返す。
+
+    「正しい場所にマッチしているのにタップが効かない」のか「そもそも
+    無関係な場所にマッチしている」のかを、画像だけで切り分けられるようにする。
+
+    tpl_shape:   (h, w) テンプレートのサイズ(矩形の大きさに使う)
+    best_loc:    (method, val, cx, cy) その時点で最も一致した位置(赤の矩形)。
+                 Noneなら描かない
+    recorded_pos: (x, y) レシピに記録されている本来のタップ位置(緑の十字)。
+                 Noneなら描かない
+    tapped_pos:  (x, y) 実際にタップした座標(黄のバツ印、タップ済みの場合のみ)。
+                 Noneなら描かない
+
+    すべて元画像と同じ「スクリーンショット空間」の座標で指定すること。
+    """
+    img = img_bgr.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    if best_loc is not None:
+        method, val, cx, cy = best_loc
+        th, tw = tpl_shape[:2]
+        x0, y0 = int(cx - tw / 2), int(cy - th / 2)
+        cv2.rectangle(img, (x0, y0), (x0 + tw, y0 + th), (0, 0, 255), 2)
+        cv2.putText(img, f"match:{method} {val:.4f}", (x0, max(15, y0 - 8)),
+                    font, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+    if recorded_pos is not None:
+        rx, ry = int(recorded_pos[0]), int(recorded_pos[1])
+        cv2.drawMarker(img, (rx, ry), (0, 255, 0), cv2.MARKER_CROSS, 26, 2)
+        cv2.putText(img, "recorded", (rx + 10, ry - 8),
+                    font, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+    if tapped_pos is not None:
+        tx, ty = int(tapped_pos[0]), int(tapped_pos[1])
+        cv2.drawMarker(img, (tx, ty), (0, 255, 255), cv2.MARKER_TILTED_CROSS, 26, 2)
+        cv2.putText(img, "tapped", (tx + 10, ty + 20),
+                    font, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+    return img
 
 
 # --------------------------------------------------------- レシピ入出力
