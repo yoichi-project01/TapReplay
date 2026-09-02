@@ -168,6 +168,33 @@ THRESHOLD_AUTO_MARGIN = 0.10
 THRESHOLD_AUTO_MIN = 0.5
 
 
+class DeviceConnectThread(QtCore.QThread):
+    """RecorderDialog用: 端末接続・画面サイズ取得・初回スクショ取得を
+    バックグラウンドで行う。u2.connect()はATX-Agentとの疎通確認のため
+    単体で数秒かかることがあり、これをUIスレッドで同期的に行うと
+    記録ウィンドウの表示自体が数秒固まって見えるため、ウィンドウを
+    先に表示してから非同期でこれらを行う"""
+    sig_log = QtCore.Signal(str)
+    sig_ok = QtCore.Signal(object, int, int, object)  # (d, sw, sh, pil)
+    sig_error = QtCore.Signal(str)
+
+    def __init__(self, serial):
+        super().__init__()
+        self.serial = serial
+
+    def run(self):
+        try:
+            self.sig_log.emit("端末に接続しています…")
+            d = core.connect(self.serial)
+            self.sig_log.emit("画面サイズを取得しています…")
+            sw, sh = d.window_size()
+            self.sig_log.emit("画面を取得しています…")
+            pil = d.screenshot()
+            self.sig_ok.emit(d, sw, sh, pil)
+        except Exception as e:
+            self.sig_error.emit(str(e))
+
+
 # ============================================ 記録ダイアログ（クリック式）
 class RecorderDialog(QtWidgets.QDialog):
     def __init__(self, serial, name, tpl_w, tpl_h, parent=None, retake_label=None):
@@ -177,8 +204,14 @@ class RecorderDialog(QtWidgets.QDialog):
         self.name = name
         self.tpl_w = tpl_w
         self.tpl_h = tpl_h
-        self.d = core.connect(serial)
-        self.sw, self.sh = self.d.window_size()
+        # 端末接続・画面サイズ取得・初回スクショ取得は、ウィンドウを表示した
+        # 直後にバックグラウンドスレッドで行う(_start_connect参照)。
+        # u2.connect()はATX-Agentの疎通確認のため単体で数秒かかることがあり、
+        # __init__内で同期的に行うとウィンドウの表示自体が固まって見えるため
+        self.d = None
+        self.sw = None
+        self.sh = None
+        self._connect_thread = None
         self.dir = core.recipe_dir(name)
         self.steps = []
         self.popups = []
@@ -192,6 +225,9 @@ class RecorderDialog(QtWidgets.QDialog):
         self.pil = None
         self.scale = 1.0
         self.shot_w, self.shot_h = None, None  # refresh()で最新のスクショサイズに更新される
+        # _load_existing()が「続きから」を読み込んだ際の記録時device_size。
+        # 接続完了(sw/shが分かった時点)で比較するため、ここでは保持だけする
+        self._loaded_device_size = None
         # 撮り直し対象として選ばれているステップ(dict、self.stepsの要素そのもの)。
         # Noneでなければ、次のon_clickは新規ステップ追加ではなく撮り直しとして扱う
         self._retake_step = None
@@ -227,20 +263,24 @@ class RecorderDialog(QtWidgets.QDialog):
         drow.addWidget(self.sp_delay)
         side.addLayout(drow)
 
-        b_refresh = QtWidgets.QPushButton("画面更新")
-        b_refresh.clicked.connect(self.refresh)
+        self.b_reconnect = QtWidgets.QPushButton("再接続")
+        self.b_reconnect.clicked.connect(self._start_connect)
+        self.b_refresh = QtWidgets.QPushButton("画面更新")
+        self.b_refresh.clicked.connect(self.refresh)
         b_undo = QtWidgets.QPushButton("一つ戻す")
         b_undo.clicked.connect(self.undo)
-        b_save = QtWidgets.QPushButton("保存して閉じる")
-        b_save.clicked.connect(self.save)
+        self.b_save = QtWidgets.QPushButton("保存して閉じる")
+        self.b_save.clicked.connect(self.save)
         b_cancel = QtWidgets.QPushButton("キャンセル")
         # reject()ではなくclose()にすることで、ウィンドウの「×」と挙動を揃える
         # (closeEvent側で未保存の変更があれば確認する)
         b_cancel.clicked.connect(self.close)
         for b, tip in (
-            (b_refresh, "端末の現在の画面を撮り直して表示を更新します。"),
+            (self.b_reconnect,
+             "端末に接続し直します。接続に失敗した時や、USBを挿し直した後に押してください。"),
+            (self.b_refresh, "端末の現在の画面を撮り直して表示を更新します。"),
             (b_undo, "直前に記録したステップ、または共通ポップアップを1つ取り消します。"),
-            (b_save, "ここまで記録した内容をレシピとして保存し、記録ウィンドウを閉じます。"),
+            (self.b_save, "ここまで記録した内容をレシピとして保存し、記録ウィンドウを閉じます。"),
             (b_cancel, "記録した内容を保存せずに記録ウィンドウを閉じます。"),
         ):
             side.addWidget(with_help(b, tip))
@@ -289,11 +329,62 @@ class RecorderDialog(QtWidgets.QDialog):
         side.addWidget(self.log, 1)
         root.addLayout(side)
 
+        # ここまでは端末通信を一切行わないUI構築のみなので、ウィンドウは
+        # このコンストラクタが返った直後(exec()呼び出し)にすぐ表示される。
+        # 既存レシピの読み込みも画像ファイルは読まない軽い処理なので同期のまま
+        # (実測: 500ステップで_load_existing 1ms未満・_refresh_lists 数ms程度。
+        # 詳細は対応時の報告を参照)
         self._load_existing(auto_continue=(retake_label is not None))
         self._refresh_lists()
-        self.refresh()
         if retake_label is not None:
             self._arm_retake_by_label(retake_label)
+
+        self.img.setText("端末に接続しています…")
+        self._set_device_controls_enabled(False)
+        self._start_connect()
+
+    def _set_device_controls_enabled(self, enabled):
+        """端末との通信を必要とする操作(画面クリックでの記録・画面更新・保存)を
+        まとめて有効/無効にする。接続完了までは無効にしておく"""
+        self.img.setEnabled(enabled)
+        self.b_refresh.setEnabled(enabled)
+        self.b_save.setEnabled(enabled)
+
+    def _start_connect(self):
+        """端末接続・画面サイズ取得・初回スクショ取得をバックグラウンドスレッドで
+        行う。「再接続」ボタンからも呼ばれる"""
+        if self._connect_thread is not None and self._connect_thread.isRunning():
+            return  # 二重に接続を開始しない
+        self.img.setText("端末に接続しています…")
+        self._set_device_controls_enabled(False)
+        self.b_reconnect.setEnabled(False)
+        self._connect_thread = DeviceConnectThread(self.serial)
+        self._connect_thread.sig_log.connect(self._msg)
+        self._connect_thread.sig_ok.connect(self._on_connected)
+        self._connect_thread.sig_error.connect(self._on_connect_failed)
+        self._connect_thread.finished.connect(
+            lambda: self.b_reconnect.setEnabled(True))
+        self._connect_thread.start()
+
+    def _on_connected(self, d, sw, sh, pil):
+        self.d = d
+        self.sw, self.sh = sw, sh
+        self.pil = pil
+        self._msg(f"接続しました（画面サイズ {self.sw}x{self.sh}）")
+        if (self._loaded_device_size is not None
+                and list(self._loaded_device_size) != [self.sw, self.sh]):
+            self._msg(
+                f"!! 注意: 記録時({self._loaded_device_size})と今の画面サイズ"
+                f"({self.sw},{self.sh})が違います")
+        self._render_current_pil()
+        self._set_device_controls_enabled(True)
+
+    def _on_connect_failed(self, message):
+        self.img.setText(
+            f"!! 接続に失敗しました:\n{message}\n\n"
+            "端末のUSB接続・USBデバッグ許可を確認し、\n"
+            "「再接続」を押してください")
+        self._msg(f"!! 接続に失敗しました: {message}")
 
     def _refresh_lists(self):
         self.list_steps_edit.blockSignals(True)
@@ -395,11 +486,9 @@ class RecorderDialog(QtWidgets.QDialog):
             self._msg(
                 f"続きから記録します（ステップ{len(prev_steps)}件・"
                 f"共通ポップアップ{len(prev_popups)}件を読み込み済み）")
-            dev_size = data.get("device_size")
-            if dev_size and list(dev_size) != [self.sw, self.sh]:
-                self._msg(
-                    f"!! 注意: 記録時({dev_size})と今の画面サイズ"
-                    f"({self.sw},{self.sh})が違います")
+            # この時点では未接続でself.sw/shが分からないため、比較は
+            # 接続完了後(_on_connected)に行う。ここでは値を覚えておくだけ
+            self._loaded_device_size = data.get("device_size")
         else:
             # ここでは削除しない。保存(save)まで遅らせることで、
             # このままキャンセルされた場合に元のレシピを壊さないようにする。
@@ -431,15 +520,34 @@ class RecorderDialog(QtWidgets.QDialog):
             if resp != QtWidgets.QMessageBox.Yes:
                 event.ignore()
                 return
+        # 接続中に閉じられた場合、スレッド終了時のシグナルが破棄済みの
+        # ウィジェットを触らないよう、先に切り離しておく(接続処理自体は
+        # 待たずにそのままバックグラウンドで終わらせる。ウィンドウを
+        # 閉じる操作を遅延させたくないため)
+        if self._connect_thread is not None and self._connect_thread.isRunning():
+            try:
+                self._connect_thread.sig_log.disconnect()
+                self._connect_thread.sig_ok.disconnect()
+                self._connect_thread.sig_error.disconnect()
+                self._connect_thread.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
         self.setResult(QtWidgets.QDialog.Rejected)
         event.accept()
 
     def refresh(self):
+        if self.d is None:
+            return  # 未接続の間は何もしない(接続完了後に_on_connectedが描画する)
         try:
             self.pil = self.d.screenshot()
         except Exception as e:
             self._msg(f"!! スクショ失敗: {e}")
             return
+        self._render_current_pil()
+
+    def _render_current_pil(self):
+        """self.pil の内容を画面エリアに描画する(端末通信は行わない)。
+        refresh()と接続完了時(_on_connected)の両方から呼ばれる"""
         # 表示スケールはスクリーンショット自体のサイズを基準にする(window_size
         # ではない)。on_click()のrx,ryはこのスケールで逆算するため、ここを
         # window_size基準のままにすると、shot_size!=window_sizeの端末で
@@ -1703,6 +1811,10 @@ class MainWindow(QtWidgets.QWidget):
             self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
             return
         try:
+            # RecorderDialog()はUI構築のみで端末通信を行わないため、ここは
+            # 即座に返る(端末接続は表示後にダイアログ側が非同期で行う)。
+            # そのため直後の「開きました」ログは、待たされた後ではなく
+            # 実際にウィンドウが表示されるタイミングに一致する
             dlg = RecorderDialog(self.serial, name,
                                  self.sp_w.value(), self.sp_h.value(), self,
                                  retake_label=retake_label)
