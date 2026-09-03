@@ -1,7 +1,9 @@
-﻿# ===================================================================
+# ===================================================================
 #  watch_build.ps1
-#  core.py / gui.py の変更を検知して自動で TapReplay.exe を再ビルドする。
-#  終了するときは Ctrl+C。
+#  Watches core.py / gui.py and rebuilds TapReplay.exe automatically
+#  whenever one of them changes. Press Ctrl+C to stop.
+#
+#  ASCII-only on purpose, for consistency with build.bat / watch_build.bat.
 # ===================================================================
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -9,10 +11,10 @@ Set-Location $root
 
 function Invoke-Build {
     $ts = Get-Date -Format 'HH:mm:ss'
-    Write-Host "`n[$ts] 変更を検知。ビルド開始..." -ForegroundColor Cyan
+    Write-Host "`n[$ts] Change detected. Building..." -ForegroundColor Cyan
 
-    # PyInstaller は dist\TapReplay を丸ごと作り直すため、
-    # 記録済みレシピ(recipes\)を退避してビルド後に戻す
+    # PyInstaller rebuilds dist\TapReplay from scratch, so back up the
+    # recorded recipes (recipes\) and restore them after the build.
     $recipesDir = Join-Path $root 'dist\TapReplay\recipes'
     $backupDir = Join-Path $env:TEMP 'TapReplay_recipes_backup'
     if (Test-Path $recipesDir) {
@@ -29,21 +31,28 @@ function Invoke-Build {
 
     $ts = Get-Date -Format 'HH:mm:ss'
     if ($LASTEXITCODE -eq 0) {
-        # THIRD_PARTY_LICENSES.txt(同梱している第三者バイナリのライセンス表示)は
-        # specのdatas/COLLECT経由だとPyInstaller 6のインクリメンタルビルドで
-        # 収録先が_internal配下になったり収録されなかったりと不安定なため、
-        # ビルド後にここで確実にトップレベルへコピーする(build.batと同じ対応)
-        Copy-Item (Join-Path $root 'THIRD_PARTY_LICENSES.txt') `
-            (Join-Path $root 'dist\TapReplay\THIRD_PARTY_LICENSES.txt') -Force
-        Write-Host "[$ts] ビルド完了 → dist\TapReplay\TapReplay.exe を更新しました" -ForegroundColor Green
+        # THIRD_PARTY_LICENSES.txt (license notices for bundled third-party
+        # binaries) is copied here explicitly: with PyInstaller 6's
+        # incremental builds, going through the spec's datas/COLLECT alone
+        # is unreliable - the file sometimes ends up under _internal, or is
+        # skipped entirely. Same approach as build.bat.
+        $licenseSrc = Join-Path $root 'THIRD_PARTY_LICENSES.txt'
+        $licenseDst = Join-Path $root 'dist\TapReplay\THIRD_PARTY_LICENSES.txt'
+        Copy-Item $licenseSrc $licenseDst -Force
+        if (-not (Test-Path $licenseDst)) {
+            Write-Host "[$ts] ERROR: Failed to copy THIRD_PARTY_LICENSES.txt into dist\TapReplay\" -ForegroundColor Red
+            Write-Host "Watching continues... (Ctrl+C to stop)"
+            return
+        }
+        Write-Host "[$ts] Build succeeded -> dist\TapReplay\TapReplay.exe updated" -ForegroundColor Green
     } else {
-        Write-Host "[$ts] !! ビルド失敗（上のログを確認してください）" -ForegroundColor Red
+        Write-Host "[$ts] Build failed (check the log above)" -ForegroundColor Red
     }
-    Write-Host "監視を継続中... (Ctrl+C で終了)"
+    Write-Host "Watching continues... (Ctrl+C to stop)"
 }
 
-Write-Host "監視開始: $root"
-Write-Host "core.py / gui.py を保存するたびに自動で再ビルドします。終了は Ctrl+C。"
+Write-Host "Watching: $root"
+Write-Host "Rebuilds automatically whenever core.py or gui.py is saved. Ctrl+C to stop."
 
 Invoke-Build
 
@@ -64,7 +73,7 @@ try {
     while ($true) {
         Start-Sleep -Seconds 1
         if ($global:pending) {
-            # 保存が連続する場合にまとめて1回にする(デバウンス)
+            # Debounce: coalesce a burst of saves into a single rebuild.
             Start-Sleep -Seconds 2
             $global:pending = $false
             Invoke-Build
@@ -75,4 +84,3 @@ finally {
     Get-EventSubscriber | Unregister-Event
     $watcher.Dispose()
 }
-
