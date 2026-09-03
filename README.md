@@ -18,7 +18,7 @@ Android 端末の画面操作を **記録して再生する** 汎用ツール。
 ## 動作要件
 
 - Windows（macOS/Linux でも Python 環境があれば動作）
-- Python 3.9 以上
+- Python 3.11〜3.13（`requirements.txt` の numpy が 3.11 以上を要求。3.14 は opencv-python / PySide6 / adbutils / PyInstaller のビルド済み wheel がまだ提供されておらず非対応）
 - Android 端末（USB デバッグ ON）
 - platform-tools（`adb`）
 
@@ -69,6 +69,10 @@ build.bat
 
 `dist/TapReplay/TapReplay.exe` が生成されます。`adb.exe` は同梱済みなので、`dist/TapReplay/` フォルダごと配布・実行すればそのまま動きます（フォルダの中身を分割せず、`_internal` フォルダも含めて丸ごと保ってください）。
 
+ビルドに成功すると、デスクトップに `TapReplay.lnk` ショートカットが自動作成されます（リンク先・作業フォルダともに `dist/TapReplay/` を指すので、ショートカットから起動しても `recipes/` は正しい場所に作られます）。同名のショートカットは確認なしで上書きされます。ショートカット作成に失敗してもビルド自体は成功扱いになり、警告が表示されるだけです（`dist/TapReplay/TapReplay.exe` は変わらず使えます）。
+
+対応バージョン（Python 3.11〜3.13）の Python が見つからない場合、`build.bat` はインストールの実行有無を必ず確認してから進めます（無言では何もインストールしません）。`py` ランチャー経由で使えるバージョンが既にあればそれを使うか尋ね、無ければ winget での Python 3.13 インストールを提案します。
+
 コードを変更するたびに `build.bat` を手動実行するのが面倒な場合は、`watch_build.bat` を開いたままにしておくと `core.py` / `gui.py` の保存を検知して自動で再ビルドしてくれます（詳細はウィンドウ内のログを参照）。
 
 ## ファイル構成
@@ -78,6 +82,7 @@ build.bat
 | `gui.py` | 本体のソース（配布・実行は exe 経由。開発時のみ直接編集） |
 | `core.py` | 端末接続・画面クリック記録・画像マッチング |
 | `build.bat` | exe を作るビルドスクリプト |
+| `create_shortcut.ps1` | ビルド成功後に `build.bat` から呼ばれる、デスクトップショートカット作成スクリプト |
 | `watch_build.bat` / `watch_build.ps1` | ソース変更を検知して自動で exe を再ビルドする監視スクリプト |
 | `TapReplay.spec` | PyInstaller のビルド設定 |
 | `icon.ico` | exe のアイコン |
