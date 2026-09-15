@@ -902,6 +902,18 @@ class PlayerThread(QtCore.QThread):
     # ため、まずは副作用の少ない間引きを採用した)
     POPUP_CHECK_INTERVAL = 1.0
 
+    # 同一周回・同一ポップアップの検知回数がこれを超えたら、原因調査用に
+    # その瞬間の画面を診断画像として保存する。実機で「同じポップアップが
+    # 繰り返し検知され、本来待っているステップの画面に到達できない」事象を
+    # 確認したが、ポップアップの検知・クローズ自体は失敗として扱われないため
+    # (閉じる動作そのものは毎回成功している)、従来のfailures.jsonl(失敗時
+    # のみ記録)には証拠が残らなかった。これはその穴を埋めるためのもので、
+    # ok/ng集計やmax_failによるリトライ停止判定には一切関与しない
+    POPUP_REPEAT_ALERT_THRESHOLD = 3
+    # 閾値を超えた後も無制限に保存し続けると、放置実行時にディスクを
+    # 圧迫するため、同一周回・同一ポップアップにつき保存枚数の上限を設ける
+    POPUP_REPEAT_MAX_SCREENSHOTS = 3
+
     # window_size空間への変換倍率(横×scale_x, 縦×scale_y)の相対差がこれを
     # 超えたら「アスペクト比が違う」として警告する。ステータスバー分の数px
     # の差やDPI丸めなど、良性の誤差は数%程度に収まることが多いのに対し、
@@ -961,6 +973,14 @@ class PlayerThread(QtCore.QThread):
         # から設定される。タップ直前のスクショ空間→表示解像度変換に使う
         self.sw = None
         self.sh = None
+        # 今どの周回かを保持しておく(繰り返しポップアップの記録に、どの周
+        # だったかを残すため。run()の冒頭で最新の値に更新される)
+        self._current_cycle = 0
+        # 共通ポップアップの繰り返し検知を周回ごとに数えるための状態。
+        # どちらも{ポップアップのlabel: 回数}で、周回の頭(run())で
+        # 空にリセットする(周回をまたいで引き継がない)
+        self._popup_repeat_counts = {}
+        self._popup_repeat_saved = {}
 
     def stop(self):
         self._stop = True
@@ -1066,8 +1086,12 @@ class PlayerThread(QtCore.QThread):
                 best = (i, s, cx, cy, val, method_used, thr_used, attempts)
         return best
 
-    def _dismiss_popup_if_any(self, gray, popups):
-        """共通ポップアップ(広告・フレンド申請等)が写っていれば閉じる。閉じたらTrue"""
+    def _dismiss_popup_if_any(self, gray, popups, waiting_step_label):
+        """共通ポップアップ(広告・フレンド申請等)が写っていれば閉じる。閉じたらTrue
+
+        waiting_step_label: このチェックの時点で本来待っていたステップのlabel。
+        繰り返し検知のログ・診断記録(【実装: 繰り返し検知の記録】)に使うだけで、
+        検知・クローズの判定そのものには使わない"""
         import random
         hit = self._find_best_match(gray, popups)
         if hit is None:
@@ -1078,14 +1102,65 @@ class PlayerThread(QtCore.QThread):
         tx, ty = self._to_window(jx, jy, gray.shape)
         core.tap(self._serial, tx, ty, self.hold_ms)
         fallback_note = "(エッジ判定で検出)" if pmethod == "edge" else ""
+
+        label = popup["label"]
+        count = self._popup_repeat_counts.get(label, 0) + 1
+        self._popup_repeat_counts[label] = count
+
         self._log(
-            f"    !! 共通ポップアップ「{popup['label']}」を検知"
+            f"    !! 共通ポップアップ「{label}」を検知"
             f"(一致{pval:.4f}[{pmethod}]){fallback_note}したので閉じました"
-            f" (タップ{tx},{ty})")
+            f" (タップ{tx},{ty})(この周で{count}回目)")
+
+        # 誤検出ではなく実際に繰り返し表示されている場合の証拠を残す。
+        # 検知・クローズ自体は毎回成功している(＝失敗ではない)ので、
+        # ok/ng集計やmax_failのリトライ判定には一切影響させない
+        if count > self.POPUP_REPEAT_ALERT_THRESHOLD:
+            saved = self._popup_repeat_saved.get(label, 0)
+            if saved < self.POPUP_REPEAT_MAX_SCREENSHOTS:
+                self._popup_repeat_saved[label] = saved + 1
+                self._save_popup_repeat_diagnostic(
+                    gray, popup, pcx, pcy, pval, pmethod, pthr,
+                    jx, jy, count, waiting_step_label)
+
         time.sleep(self.after)
         return True
 
-    def _maybe_dismiss_popup(self, gray, popups):
+    def _save_popup_repeat_diagnostic(self, gray, popup, pcx, pcy, pval, pmethod, pthr,
+                                       tapped_x, tapped_y, count, waiting_step_label):
+        """繰り返し検知の瞬間の画面を診断画像として保存し、failures.jsonlにも
+        記録する。保存に失敗してもここで例外を飲み込み、再生を止めない
+        (呼び出し元は既にポップアップを閉じてタップ送信まで終えているため、
+        記録に失敗したからといって再生継続を妨げるべきではない)。
+
+        gray(既にマッチングに使った画面)をそのままBGR化して使う。新たに
+        スクリーンショットを撮り直さないのは、(1) 実際に判定した瞬間の
+        画面をそのまま残せる、(2) 余計なadb往復を増やしてポーリングを
+        遅くしない、の2点のため"""
+        try:
+            recipe_dir = core.recipe_dir(self.name)
+            img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            recorded_pos = None
+            if popup.get("x") is not None and popup.get("y") is not None:
+                recorded_pos = (popup["x"], popup["y"])
+            img = core.annotate_diagnostic(
+                img, popup["_gray"].shape,
+                best_loc=(pmethod, pval, pcx, pcy),
+                recorded_pos=recorded_pos,
+                tapped_pos=(tapped_x, tapped_y))
+            safe_label = "".join(c if c.isalnum() else "_" for c in popup["label"])[:30]
+            fname = (f"popup_repeat_{datetime.datetime.now():%H%M%S}_"
+                     f"{safe_label}_{count}.png")
+            core.imwrite(recipe_dir / fname, img)
+            attempts = [{"method": pmethod, "score": round(float(pval), 4),
+                         "threshold": round(float(pthr), 4)}]
+            core.append_popup_repeat(
+                self.name, self._current_cycle, popup["label"], count,
+                waiting_step_label, fname, attempts=attempts)
+        except Exception as e2:
+            self._log(f"!! 繰り返しポップアップの診断保存に失敗: {e2}")
+
+    def _maybe_dismiss_popup(self, gray, popups, waiting_step_label):
         """待機ループ中の共通ポップアップ探索を間引いて呼ぶ(POPUP_CHECK_INTERVAL秒に1回)。
         タップ直後の「効いたか確認」時は_dismiss_popup_if_anyを直接呼ぶこと
         (頻度が低くタップのたびなので間引く必要が薄く、割り込み検知の
@@ -1094,7 +1169,7 @@ class PlayerThread(QtCore.QThread):
         if now - self._last_popup_check < self.POPUP_CHECK_INTERVAL:
             return False
         self._last_popup_check = now
-        return self._dismiss_popup_if_any(gray, popups)
+        return self._dismiss_popup_if_any(gray, popups, waiting_step_label)
 
     def _wait_and_tap(self, d, cursor, popups):
         """cursor.current() が指すノードの画像が現れるまで待ってタップする。
@@ -1134,7 +1209,7 @@ class PlayerThread(QtCore.QThread):
             # 共通ポップアップは、対象ステップの探索より先にチェックする
             # (どのステップを待っていても、順序に関係なく割り込んで閉じる)。
             # ただしmasked_znccは重いため、間引いて探索する(POPUP_CHECK_INTERVAL)
-            if self._maybe_dismiss_popup(gray, popups):
+            if self._maybe_dismiss_popup(gray, popups, step["label"]):
                 continue
 
             cx, cy, val, method_used, thr_used, attempts = self._match_candidate(gray, step)
@@ -1185,7 +1260,7 @@ class PlayerThread(QtCore.QThread):
                         # ボタンが消えずに残っているように見えても、実は共通
                         # ポップアップに覆われていて反応していないだけ、という
                         # ケースがあるため先に確認する(頻度が低いため間引かない)
-                        if self._dismiss_popup_if_any(after_gray, popups):
+                        if self._dismiss_popup_if_any(after_gray, popups, step["label"]):
                             popup_interrupted = True
                             break
                         ncx, ncy, nval, nmethod, nthr, nattempts = self._match_candidate(
@@ -1389,6 +1464,11 @@ class PlayerThread(QtCore.QThread):
                 if self._stop:
                     break
                 cycle += 1
+                self._current_cycle = cycle
+                # 共通ポップアップの繰り返し検知カウントは周回をまたいで
+                # 引き継がない(周回ごとに0から数え直す)
+                self._popup_repeat_counts = {}
+                self._popup_repeat_saved = {}
                 self._log(f"=== ループ {cycle} ===")
                 current_step = None
                 try:
@@ -2013,8 +2093,14 @@ class MainWindow(QtWidgets.QWidget):
             self.list_steps.addItem("(このレシピはまだ記録されていません)")
 
         failures = core.load_failures(name)
+        # 「よく止まる箇所」のランキングは、従来通り実際の失敗(タイムアウト・
+        # 押しても反応しない等)だけを対象にする。繰り返しポップアップの記録は
+        # 失敗ではない(検知・クローズ自体は毎回成功している)ため、ここに
+        # 混ぜるとランキングの意味が変わってしまうので除外する
         counts = {}
         for f in failures:
+            if f.get("kind") == "popup_repeat":
+                continue
             label = f.get("step_label", "?")
             counts[label] = counts.get(label, 0) + 1
         ranked = sorted(counts.items(), key=lambda kv: -kv[1])
@@ -2024,7 +2110,13 @@ class MainWindow(QtWidgets.QWidget):
             self.tbl_rank.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{cnt}回"))
 
         for f in failures[:100]:
-            text = f"{f.get('ts', '?')}  {f.get('step_label', '?')}  {f.get('reason', '')[:30]}"
+            if f.get("kind") == "popup_repeat":
+                # 通常の失敗と見分けられるよう、先頭に区別用のタグを付ける
+                text = (f"{f.get('ts', '?')}  [繰り返しポップアップ] "
+                        f"{f.get('popup_label', '?')} この周で{f.get('count', '?')}回目"
+                        f"  待機中:「{f.get('waiting_step_label', '?')}」")
+            else:
+                text = f"{f.get('ts', '?')}  {f.get('step_label', '?')}  {f.get('reason', '')[:30]}"
             # attempts: そのステップの検出で試した手法ごとの最高一致度
             # (【実装3】)。どの手法が実際に効いているかを一覧で分かるようにする
             attempts = f.get("attempts")

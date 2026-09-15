@@ -568,6 +568,35 @@ def append_failure(name, step_label, reason, screenshot, attempts=None):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def append_popup_repeat(name, cycle, popup_label, count, waiting_step_label,
+                         screenshot, attempts=None):
+    """共通ポップアップが同一周回内で繰り返し検知されたことを1件、
+    recipes/<name>/failures.jsonl に追記する(append_failureと同じファイルを
+    共用する)。
+
+    ポップアップの検知・クローズ自体は毎回成功しており失敗ではないため、
+    通常の失敗記録(append_failure)とは"kind"キーで区別する。cycle(何周目か)・
+    count(この周で何回目の検知か)・waiting_step_label(その時点で本来
+    待っていたステップ)を残すことで、「どのステップを待っている間に、
+    どのポップアップが何回出たか」を後から集計できるようにする"""
+    d = recipe_dir(name)
+    rec = {
+        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": "popup_repeat",
+        "cycle": cycle,
+        "popup_label": popup_label,
+        "count": count,
+        "waiting_step_label": waiting_step_label,
+        "reason": (f"ポップアップ「{popup_label}」がこの周で{count}回検知されました"
+                   f"(待機中のステップ:「{waiting_step_label}」)"),
+        "screenshot": screenshot,
+    }
+    if attempts:
+        rec["attempts"] = attempts
+    with open(d / "failures.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def load_failures(name):
     """失敗履歴を新しい順のリストで返す"""
     path = recipe_path(name) / "failures.jsonl"
