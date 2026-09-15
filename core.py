@@ -398,10 +398,143 @@ def _load_step_images(d, step, label):
         step["_mask"] = m
 
 
+def iter_tap_nodes(nodes):
+    """steps(木構造)を深さ優先で辿り、type:tap のノードだけを順番に返す
+    ジェネレータ。フェーズ0時点のレシピは全ノードがtapなので、これは
+    単純にnodesをそのまま返すのと同じ結果になる。
+
+    if/loopノードの子ブロック(then/else/body)へ実際に潜って辿るのは
+    フェーズ1以降で実装する。どちらの枝に進むか・何回ループするかは
+    再生時の端末の画面を見て初めて決まる(条件判定は実行時の状態に
+    依存する)ため、ここで事前に一括展開することはできない。
+    このジェネレータはtapのみで構成されたレシピ専用であり、if/loopが
+    混ざったレシピは非対応として明示的にエラーにする(黙って無視したり
+    誤った順序で展開したりしない)。
+
+    load_recipe()でのテンプレート一括読み込みにのみ使う軽量ユーティリティ。
+    再生の実行順そのもの(どのノードを待ってタップするか)は、条件が
+    実行時の端末の状態に依存するため事前展開できない。そちらはCursorが
+    担う(このモジュール内で定義)"""
+    for node in nodes:
+        ntype = node.get("type", "tap")
+        if ntype == "tap":
+            yield node
+        elif ntype in ("if", "loop"):
+            raise NotImplementedError(
+                f"type={ntype!r} の実行制御はフェーズ1以降で対応します"
+                "(条件評価が必要なため、ここでは未対応)")
+        else:
+            raise ValueError(f"load_recipe: 未知のノードtypeです: {ntype!r}")
+
+
+class Cursor:
+    """再生位置を木構造上で表すカーソル。事前に全ノードを展開せず、
+    実行しながら動的に「今どのノードを待つべきか」を決めるための土台。
+
+    if/loopが入ると、どちらの枝を通るか・何回ループするかは実機の画面を
+    見て初めて決まる(条件判定は実行時の状態に依存する)。そのため
+    「全ノードをあらかじめ1本の配列に展開してからインデックスで進む」
+    やり方は成立しない。このCursorは、代わりに「今いるブロック(兄弟
+    ノードの並び)の中の位置」を根から現在地までスタックとして積み、
+    1ノードずつ実行しながら次を決める。
+
+    _stack: [[nodes, index], ...] — 根から現在位置までの各ブロックについて、
+    [そのブロックの兄弟ノード列, 今どこを指しているか] を、ブロックの
+    入れ子ぶん積んだスタック(内側の要素をミュータブルにしてあるのは、
+    インデックスをその場で書き換えられるようにするため)。
+    あるブロックを最後まで実行し終えたら、current()が自動的に1段上の
+    ブロックへ戻る(= ブロックの退出)。
+
+    フェーズ0時点のレシピは全ノードがルート直下のtapのみなので、
+    スタックは常に1段のまま([ [root_nodes, index] ])で、ルートを
+    順番に進むだけになり、挙動は従来のインデックス走査と一致する。
+    if/loopノードに実際に入る(then/else/bodyへpushする)処理は
+    フェーズ1で条件評価とあわせて実装する。それまでは、tap以外の
+    ノードに出会うとcurrent()がエラーにする(iter_tap_nodes()と同じ
+    考え方: 黙って無視したり誤った順序で展開したりしない)"""
+
+    def __init__(self, root_nodes):
+        self._stack = [[root_nodes, 0]]
+        # advance()/advance_to_sibling()が一度でも呼ばれたか。
+        # 「周回の最初のステップかどうか」の判定に使う(is_at_start参照)。
+        # ブロックへの出入り(current()内の自動pop、将来のenter_block)は
+        # 実行そのものではなく位置探しのナビゲーションなので、これには
+        # 影響させない
+        self._moved = False
+
+    def current(self):
+        """今指しているtapノードを返す。全ノードを実行し終えていればNone"""
+        while self._stack:
+            nodes, i = self._stack[-1]
+            if i >= len(nodes):
+                # このブロックは最後まで実行し終えた → 1段上に戻る(退出)
+                self._stack.pop()
+                continue
+            node = nodes[i]
+            ntype = node.get("type", "tap")
+            if ntype == "tap":
+                return node
+            if ntype in ("if", "loop"):
+                raise NotImplementedError(
+                    f"type={ntype!r} の実行制御はフェーズ1以降で対応します"
+                    "(条件評価が必要なため、ここでは未対応)")
+            raise ValueError(f"Cursor: 未知のノードtypeです: {ntype!r}")
+        return None
+
+    def advance(self):
+        """今指しているノードから1つ先(同じブロック内の次の兄弟)へ進む
+        (タップ成功時など、通常の前進に使う)"""
+        self._stack[-1][1] += 1
+        self._moved = True
+
+    def advance_to_sibling(self, offset):
+        """今のブロック内で、今の位置からoffset個(1以上)先の兄弟ノードへ
+        直接進む(スキップ探索で先の兄弟を見つけてタップした場合に使う)"""
+        if offset < 1:
+            raise ValueError(f"Cursor.advance_to_sibling: offsetは1以上である必要があります: {offset}")
+        self._stack[-1][1] += offset
+        self._moved = True
+
+    def siblings_ahead(self, limit):
+        """今のノードより後ろにある、同じブロック内の兄弟ノードを最大limit件
+        返す(スキップ探索の候補用)。他のブロックへは絶対にまたがない
+        (if/loopが入っても、then/elseの枝をまたいで誤って飛んだり、
+        loopの外へ早飛びしたりしないようにするため)"""
+        nodes, i = self._stack[-1]
+        return nodes[i + 1: i + 1 + limit]
+
+    def is_at_start(self):
+        """レシピの最初のノードをまだ1つも実行(前進)していない状態か。
+        スキップ探索を許可するかの判定に使う(周回の開始画面に居ないのは
+        想定外の状態であり、いきなり飛び先を推測すると全く無関係な場所に
+        飛んで周回そのものが壊れるため、最初の1回だけはスキップ探索を
+        しない)"""
+        return not self._moved
+
+    def root_index(self):
+        """今いちばん外側のブロックで指しているインデックス(0始まり)。
+        フェーズ0はネストが無いためスタックは常に1段で、これは
+        『レシピの何番目のステップか』とそのまま一致する(ログ表示用)。
+        フェーズ1でif/loopの中に実際に入るようになったら、この値は
+        『その時点でルート直下にあるif/loopノード自体の位置』を指す
+        だけになり、ネストした中の細かい位置は表せなくなる。スキップ
+        探索のログにどう番号を出すかは、その時に改めて設計すること"""
+        return self._stack[0][1]
+
+    def enter_block(self, nodes):
+        """子ブロック(then/else/bodyなど)へ入る(スタックに1段積む=
+        ブロックの入場)。フェーズ1でif/loopの条件を評価した後に呼ぶ想定。
+        フェーズ0時点ではcurrent()がif/loopに出会うと先に例外を出すため、
+        この関数はまだどこからも呼ばれない"""
+        self._stack.append([nodes, 0])
+
+
 def load_recipe(name):
     d = recipe_path(name)
     data = json.loads((d / "recipe.json").read_text(encoding="utf-8"))
     for step in data["steps"]:
+        step.setdefault("type", "tap")
+    for step in iter_tap_nodes(data["steps"]):
         _load_step_images(d, step, "ステップ")
     data.setdefault("popups", [])
     for popup in data["popups"]:

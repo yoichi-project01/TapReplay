@@ -1096,26 +1096,27 @@ class PlayerThread(QtCore.QThread):
         self._last_popup_check = now
         return self._dismiss_popup_if_any(gray, popups)
 
-    def _wait_and_tap(self, d, all_steps, idx, popups):
-        """all_steps[idx] の画像が現れるまで待ってタップする。
+    def _wait_and_tap(self, d, cursor, popups):
+        """cursor.current() が指すノードの画像が現れるまで待ってタップする。
 
-        idx>=1の場合に限り、見つからない間、レシピ内の"これより後
-        (SKIP_SEARCH_RANGEステップ以内)"のステップ画像が写っていないかも
-        探す。見つかればそれをタップし、再生位置をそこまで進める。
-        idx==0(周回の最初のステップ)で見つからない場合はスキップしない。
+        cursor.is_at_start()(周回の最初のステップ)でない場合に限り、
+        見つからない間、今いるブロック内で"これより後(SKIP_SEARCH_RANGE
+        ステップ以内)"の兄弟ノードの画像が写っていないかも探す(他の
+        ブロック、たとえばif/loopで枝分かれした別の枝へは絶対にまたがない)。
+        見つかればそれをタップし、再生位置をそこまで進める。
+        周回の最初のステップで見つからない場合はスキップしない。
         周回の開始画面に居ないのは想定外の状態であり、飛び先を推測すると
         全く無関係な場所に飛んで周回そのものが壊れるため(実機ログで
         5ステップ中ステップ1→5に飛ぶ事例を確認)。
 
-        戻り値: (実際にタップできたステップのインデックス, スキップしたか)
-                通常は (idx, False)。この先のステップへ復帰した場合は
-                (復帰先のインデックス, True)。呼び出し元(run())は、
-                戻り値の次のインデックスから再開し、スキップの有無で
-                その周を「成功」と数えるかを判断すること。
+        成功時、cursorを1つ(通常のタップ)または複数(スキップして復帰した
+        場合)前進させたうえで戻る。戻り値: スキップして復帰したか(bool)。
+        呼び出し元(run())は、この戻り値でその周を「成功」と数えるかを
+        判断すること。
         タイムアウトした場合は TimeoutError を送出する。
         """
         import random
-        step = all_steps[idx]
+        step = cursor.current()
         deadline = time.time() + self.step_timeout
         # best_by_method: {手法名: (これまでの最高一致度, その時のしきい値)}。
         # 試した手法すべての最高値を残しておき、タイムアウト/失敗時の
@@ -1166,7 +1167,8 @@ class PlayerThread(QtCore.QThread):
 
                     if not self.verify:
                         time.sleep(self.after)
-                        return idx, False
+                        cursor.advance()
+                        return False
 
                     # タップ後の消失確認は1回きりの判定にしない。押した直後は
                     # 画面遷移アニメーションの途中であることが多く、そこだけ
@@ -1209,7 +1211,8 @@ class PlayerThread(QtCore.QThread):
                     elapsed = time.time() - verify_start
                     if gone:
                         self._log(f"    …消失確認: {elapsed:.1f}秒で消えました")
-                        return idx, False  # ボタンが消えた＝タップ成功、次へ
+                        cursor.advance()
+                        return False  # ボタンが消えた＝タップ成功、次へ
 
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
                     fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
@@ -1227,11 +1230,11 @@ class PlayerThread(QtCore.QThread):
                     "遷移しませんでした(同じ場所を押しても無反応)")
 
             # 対象の画像が見つからない → 想定外の画面(広告・確認ダイアログ等)の
-            # 可能性があるので、レシピ内の"これより後"のステップ画像が
-            # 写っていないか探す(前のステップは対象にしない)。ただし
-            # idx==0(周回の最初)では発動しない(上のdocstring参照)
-            if idx > 0:
-                candidates = all_steps[idx + 1: idx + 1 + self.SKIP_SEARCH_RANGE]
+            # 可能性があるので、今いるブロック内で"これより後"の兄弟ノードの
+            # 画像が写っていないか探す(前のノードや、他のブロックは対象に
+            # しない)。ただし周回の最初のステップでは発動しない(上のdocstring参照)
+            if not cursor.is_at_start():
+                candidates = cursor.siblings_ahead(self.SKIP_SEARCH_RANGE)
                 other = self._find_best_match(gray, candidates)
                 if other is not None:
                     local_idx, other_step, ocx, ocy, oval, omethod, othr, oattempts = other
@@ -1240,19 +1243,26 @@ class PlayerThread(QtCore.QThread):
                         # 厳しくしている。それに届かなければスキップしない
                         other = None
                 if other is not None:
-                    target_idx = idx + 1 + local_idx
+                    # ログ表示用の1based番号。root_index()はフェーズ0時点
+                    # (ネスト無し)でのみ「レシピの何番目か」と一致する
+                    # (Cursor.root_index()のdocstring参照)
+                    current_display = cursor.root_index() + 1
+                    target_display = current_display + local_idx + 1
                     jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
                     jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
                     tx, ty = self._to_window(jx, jy, gray.shape)
                     core.tap(self._serial, tx, ty, self.hold_ms)
                     fallback_note = "(エッジ判定で検出)" if omethod == "edge" else ""
                     self._log(
-                        f"    !! ステップ{idx + 1}「{step['label']}」をスキップして"
-                        f"ステップ{target_idx + 1}「{other_step['label']}」へ進みました"
+                        f"    !! ステップ{current_display}「{step['label']}」をスキップして"
+                        f"ステップ{target_display}「{other_step['label']}」へ進みました"
                         f"(この先の画像を検知・一致{oval:.4f}[{omethod}]){fallback_note}")
                     time.sleep(self.after)
-                    # 元の対象を待ち続けても二度と現れないので、進んだ先から再開する
-                    return target_idx, True
+                    # 元の対象を待ち続けても二度と現れないので、進んだ先(=見つけた
+                    # 兄弟ノード)の次から再開する(見つけた兄弟ノード自体はタップ
+                    # 済みなので、そこはもう待たない)
+                    cursor.advance_to_sibling(local_idx + 2)
+                    return True
 
             # まだ見つからない → 数秒おきに現在の一致度を報告
             if time.time() - last_report >= 3:
@@ -1382,15 +1392,19 @@ class PlayerThread(QtCore.QThread):
                 self._log(f"=== ループ {cycle} ===")
                 current_step = None
                 try:
-                    step_idx = 0
-                    n_steps = len(data["steps"])
+                    # 周回のたびに、木構造の根からたどり直す新しいカーソルを
+                    # 作る(前回の走査位置を引き継がない)。事前に全ノードを
+                    # 1本の配列へ展開するのではなく、1ノードずつ実行しながら
+                    # 次を決める(if/loopの条件はcondition評価が実行時の
+                    # 画面依存なので、事前展開できないため。core.Cursor参照)
+                    cursor = core.Cursor(data["steps"])
                     skipped_this_cycle = False
-                    while step_idx < n_steps:
-                        current_step = data["steps"][step_idx]
-                        reached, skipped = self._wait_and_tap(
-                            d, data["steps"], step_idx, popups)
+                    while True:
+                        current_step = cursor.current()
+                        if current_step is None:
+                            break
+                        skipped = self._wait_and_tap(d, cursor, popups)
                         skipped_this_cycle = skipped_this_cycle or skipped
-                        step_idx = reached + 1
                     avg = (time.time() - started) / cycle
                     if skipped_this_cycle:
                         # スキップで途中のステップを飛ばした周は、実際には
