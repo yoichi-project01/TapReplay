@@ -444,6 +444,24 @@ def iter_tap_leaves(nodes):
             yield from iter_tap_leaves(node.get("body", []))
 
 
+def get_node_by_path(steps, path):
+    """steps(木構造)上の1ノードを、(トップレベルindex, "then"/"else",
+    ブロック内index, ...) の形のpathから取り出す。行番号のような「その場限り
+    のインデックス」ではなく、木構造上の位置そのものを表すため、then/elseの
+    中身が増減してもレシピを保存し直すまでは指す先がずれない(呼び出し側が
+    レシピを再読み込みした直後に使うことを想定)"""
+    container = steps
+    node = None
+    i = 0
+    while i < len(path):
+        node = container[path[i]]
+        i += 1
+        if i < len(path):
+            container = node[path[i]]
+            i += 1
+    return node
+
+
 def _load_node_images(d, nodes, label):
     """steps(木構造)を深さ優先で辿り、tapノードのテンプレート・マスクと、
     ifノードのcondition画像を読み込む。then/elseへ実際に再帰する点が、

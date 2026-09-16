@@ -1036,6 +1036,104 @@ class BlockTreeWidget(QtWidgets.QTreeWidget):
             self.dropping = False
 
 
+class NodeTreeBuilder:
+    """steps(木構造)をBlockTreeWidgetへツリー表示として展開する共通ロジック。
+    分岐編集画面(StructureEditorDialog、編集可能)と記録内容タブ(読み取り
+    専用)の両方がこれを使う(表示ロジックの重複実装を避けるため)。
+
+    roleには"node"(実データへの参照そのもの。同じ画面内でそのまま編集する
+    StructureEditorDialog用)と"path"(トップレベルindex, "then"/"else",
+    ブロック内index, ... の形。MaskEditorDialogのように、接続し直さず
+    レシピを改めて読み込む側が同じノードを再特定するためのもの。
+    core.get_node_by_path()にそのまま渡せる)の両方を積んでおく"""
+
+    def __init__(self, tree, recipe_dir, editable):
+        self.tree = tree
+        self.recipe_dir = recipe_dir
+        self.editable = editable
+
+    def build(self, nodes):
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        self.tree.reset_roles()
+        self._build_container(None, nodes, path=(), depth=1)
+        self.tree.expandAll()
+        self.tree.blockSignals(False)
+
+    def _thumb_icon(self, image_name):
+        if not image_name:
+            return None
+        path = self.recipe_dir / image_name
+        if not path.exists():
+            return None
+        pix = QtGui.QPixmap(str(path))
+        if pix.isNull():
+            return None
+        pix = pix.scaled(48, 48, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        return QtGui.QIcon(pix)
+
+    def _build_container(self, parent_item, nodes, path, depth):
+        for i, node in enumerate(nodes):
+            node_path = path + (i,)
+            ntype = node.setdefault("type", "tap")
+            if ntype == "if":
+                item = self._make_if_item(node, node_path, depth)
+            else:
+                item = self._make_tap_item(node, node_path, depth)
+            if parent_item is None:
+                self.tree.addTopLevelItem(item)
+            else:
+                parent_item.addChild(item)
+
+    def _make_tap_item(self, node, path, depth):
+        item = QtWidgets.QTreeWidgetItem([node.get("label", "?")])
+        self.tree.set_role(item, {"kind": "node", "node": node, "path": path, "depth": depth})
+        if self.editable:
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+        icon = self._thumb_icon(node.get("context"))
+        if icon is not None:
+            item.setIcon(0, icon)
+        return item
+
+    def _make_if_item(self, node, path, depth):
+        item = QtWidgets.QTreeWidgetItem([f"[if] {node.get('label', '?')}"])
+        self.tree.set_role(item, {"kind": "node", "node": node, "path": path, "depth": depth})
+        if self.editable:
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+        # ifノード自体は全体スクリーンショット(context)を持たないので、
+        # サムネイルはcondition(判定に使う画像)のtemplateを使う
+        icon = self._thumb_icon(node.get("condition", {}).get("template"))
+        if icon is not None:
+            item.setIcon(0, icon)
+
+        then_header = self._make_branch_header(node, "then", depth + 1)
+        item.addChild(then_header)
+        self._build_container(then_header, node.setdefault("then", []), path + ("then",), depth + 1)
+
+        else_header = self._make_branch_header(node, "else", depth + 1)
+        item.addChild(else_header)
+        else_list = node.setdefault("else", [])
+        if else_list:
+            self._build_container(else_header, else_list, path + ("else",), depth + 1)
+        else:
+            placeholder = QtWidgets.QTreeWidgetItem(
+                ["(空。フェーズ1bで実機から追加記録できるようになります)" if self.editable
+                 else "(空)"])
+            placeholder.setFlags(QtCore.Qt.ItemIsEnabled)
+            else_header.addChild(placeholder)
+        return item
+
+    def _make_branch_header(self, if_node, branch, depth):
+        item = QtWidgets.QTreeWidgetItem(["then:" if branch == "then" else "else:"])
+        self.tree.set_role(
+            item, {"kind": "branch_header", "if_node": if_node, "branch": branch, "depth": depth})
+        item.setFlags((item.flags() & ~QtCore.Qt.ItemIsSelectable) & ~QtCore.Qt.ItemIsDragEnabled)
+        font = item.font(0)
+        font.setItalic(True)
+        item.setFont(0, font)
+        return item
+
+
 class ConditionPickerDialog(QtWidgets.QDialog):
     """ifの条件として使う画像を選ぶ画面。フェーズ1a時点では新規撮影はせず、
     既に撮影済みのステップのtemplate/mask/method/thresholdをそのまま
@@ -1249,6 +1347,7 @@ class StructureEditorDialog(QtWidgets.QDialog):
 
         root.addLayout(side)
 
+        self._builder = NodeTreeBuilder(self.tree, self.recipe_dir, editable=True)
         self._rebuild_tree()
 
     # ---------------------------------------------------------- データ入出力
@@ -1291,77 +1390,8 @@ class StructureEditorDialog(QtWidgets.QDialog):
         event.accept()
 
     # ---------------------------------------------------------- ツリー構築
-    def _thumb_icon(self, context_name):
-        if not context_name:
-            return None
-        path = self.recipe_dir / context_name
-        if not path.exists():
-            return None
-        pix = QtGui.QPixmap(str(path))
-        if pix.isNull():
-            return None
-        pix = pix.scaled(48, 48, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-        return QtGui.QIcon(pix)
-
     def _rebuild_tree(self):
-        self.tree.blockSignals(True)
-        self.tree.clear()
-        self.tree.reset_roles()
-        self._build_container(None, self.data["steps"], depth=1)
-        self.tree.expandAll()
-        self.tree.blockSignals(False)
-
-    def _build_container(self, parent_item, nodes, depth):
-        for node in nodes:
-            ntype = node.setdefault("type", "tap")
-            if ntype == "if":
-                item = self._make_if_item(node, depth)
-            else:
-                item = self._make_tap_item(node, depth)
-            if parent_item is None:
-                self.tree.addTopLevelItem(item)
-            else:
-                parent_item.addChild(item)
-
-    def _make_tap_item(self, node, depth):
-        item = QtWidgets.QTreeWidgetItem([node.get("label", "?")])
-        self.tree.set_role(item, {"kind": "node", "node": node, "depth": depth})
-        item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
-        icon = self._thumb_icon(node.get("context"))
-        if icon is not None:
-            item.setIcon(0, icon)
-        return item
-
-    def _make_if_item(self, node, depth):
-        item = QtWidgets.QTreeWidgetItem([f"[if] {node.get('label', '?')}"])
-        self.tree.set_role(item, {"kind": "node", "node": node, "depth": depth})
-        item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
-
-        then_header = self._make_branch_header(node, "then", depth + 1)
-        item.addChild(then_header)
-        self._build_container(then_header, node.setdefault("then", []), depth + 1)
-
-        else_header = self._make_branch_header(node, "else", depth + 1)
-        item.addChild(else_header)
-        else_list = node.setdefault("else", [])
-        if else_list:
-            self._build_container(else_header, else_list, depth + 1)
-        else:
-            placeholder = QtWidgets.QTreeWidgetItem(
-                ["(空。フェーズ1bで実機から追加記録できるようになります)"])
-            placeholder.setFlags(QtCore.Qt.ItemIsEnabled)
-            else_header.addChild(placeholder)
-        return item
-
-    def _make_branch_header(self, if_node, branch, depth):
-        item = QtWidgets.QTreeWidgetItem(["then:" if branch == "then" else "else:"])
-        self.tree.set_role(
-            item, {"kind": "branch_header", "if_node": if_node, "branch": branch, "depth": depth})
-        item.setFlags((item.flags() & ~QtCore.Qt.ItemIsSelectable) & ~QtCore.Qt.ItemIsDragEnabled)
-        font = item.font(0)
-        font.setItalic(True)
-        item.setFont(0, font)
-        return item
+        self._builder.build(self.data["steps"])
 
     def _container_of(self, parent_item):
         """parent_item(then:/else:見出し、またはNone=ルート)が表す
@@ -1507,7 +1537,10 @@ class StructureEditorDialog(QtWidgets.QDialog):
             return
         parent = item.parent()
         container = self._container_of(parent)
-        idx = container.index(node)
+        # list.index()は==での一致判定のため、内容が偶然同じ(ラベル・条件・
+        # then中身が全て等しい)別のifノードを誤って解除してしまう恐れがある。
+        # is での同一オブジェクト判定に限定する(on_delete_selectedと同じ考え方)
+        idx = next(i for i, n in enumerate(container) if n is node)
         container[idx:idx + 1] = node.get("then", [])
         self._dirty = True
         self._rebuild_tree()
@@ -1567,16 +1600,23 @@ class MaskEditorDialog(QtWidgets.QDialog):
     # ことが多いため、この高さに収まるよう縮小/拡大する目安
     TARGET_DISPLAY_HEIGHT = 900
 
-    def __init__(self, name, kind, index, parent=None):
+    def __init__(self, name, kind, target, parent=None):
+        """target: kind=="popups"のときは行番号(int、popupsは常にフラットな
+        配列なのでこれで一意に特定できる)。kind=="steps"のときは木構造上の
+        path(タプル。core.get_node_by_path参照。if/elseが混ざったstepsを
+        行番号で特定すると、ズレて別のステップを書き換えてしまうため)"""
         super().__init__(parent)
         self.name = name
         self.kind = kind  # "steps" or "popups"
-        self.index = index
+        self.target = target
         self.recipe_dir = core.recipe_path(name)
         self.setWindowTitle(f"マスクを調整: {name}")
 
         self.full_data = json.loads((self.recipe_dir / "recipe.json").read_text(encoding="utf-8"))
-        self.node = self.full_data[self.kind][self.index]
+        if self.kind == "steps":
+            self.node = core.get_node_by_path(self.full_data["steps"], self.target)
+        else:
+            self.node = self.full_data["popups"][self.target]
 
         tpl_path = self.recipe_dir / self.node["template"]
         orig_tpl_gray = core.imread(tpl_path, cv2.IMREAD_GRAYSCALE)
@@ -2168,9 +2208,20 @@ class PlayerThread(QtCore.QThread):
         """candidates のうち今の画面に写っているものを探す(一致度が最も高いものを返す)。
         戻り値は (candidates内でのインデックス, 候補dict, cx, cy, val,
         method_used, thr_used, attempts) または見つからなければ None。
-        ほぼ無地のテンプレートは暗転画面などに誤検知しやすいため対象から除外する"""
+        ほぼ無地のテンプレートは暗転画面などに誤検知しやすいため対象から除外する。
+
+        candidatesにifノードが混ざっていた場合、そこで探索を打ち切る(それより
+        先の候補は見ない)。ifノードは"_gray"を持たないのでそのまま扱うと
+        KeyErrorになる、という理由だけでなく、そもそも「ifを飛び越して
+        その先のtapへスキップする」こと自体を許してはいけない。ifは条件判定に
+        よってthen/elseどちらへ進むか決めるためのノードであり、それを
+        素通りしてしまうと分岐そのものが評価されずに無視されてしまう。
+        siblings_ahead()が返す候補は常に「今のノードから見て手前から順」なので、
+        先頭からこの位置まで(if本体を含まない)だけを候補にすれば安全"""
         best = None
         for i, s in enumerate(candidates):
+            if s.get("type", "tap") != "tap":
+                break
             if not core.is_distinctive(s["_gray"]):
                 continue
             cx, cy, val, method_used, thr_used, attempts = self._match_candidate(gray, s)
@@ -3009,10 +3060,18 @@ class MainWindow(QtWidgets.QWidget):
 
         box = QtWidgets.QGroupBox("記録したステップ")
         bl = QtWidgets.QVBoxLayout(box)
-        self.list_steps = QtWidgets.QListWidget()
+        # if/elseを含む木構造をそのまま表示するため、分岐編集画面
+        # (StructureEditorDialog)と同じBlockTreeWidget/NodeTreeBuilderを
+        # 読み取り専用(editable=False)で使う。並び替え・編集はできない
+        self.list_steps = BlockTreeWidget()
+        self.list_steps.setHeaderHidden(True)
         self.list_steps.setIconSize(QtCore.QSize(64, 64))
+        self.list_steps.setDragDropMode(QtWidgets.QAbstractItemView.NoDragDrop)
+        self.list_steps.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         cv.addLayout(groupbox_help(
-            "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。"))
+            "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。"
+            "[if]の行は分岐(if)で、その下のthen:/else:の中に、条件が成立/不成立の"
+            "ときに実行するステップがぶら下がります。"))
         bl.addWidget(self.list_steps)
         b_adjust_step = QtWidgets.QPushButton("選択したステップのマスクを調整")
         b_adjust_step.clicked.connect(
@@ -3275,12 +3334,30 @@ class MainWindow(QtWidgets.QWidget):
         if not is_valid_recipe_name(name):
             self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
             return
-        row = list_widget.currentRow()
-        if row < 0:
-            self.append("!! 調整する項目を一覧から選択してください")
-            return
+        if kind == "steps":
+            # stepsはif/elseを含む木構造なので、一覧上の行番号は
+            # data["steps"]のインデックスとは一致しない(ifが混ざると
+            # ズレて、無関係なステップを書き換えてしまう)。NodeTreeBuilder
+            # がroleに積んでおいたpath(木構造上の位置)で対象を特定する
+            item = list_widget.currentItem()
+            role = list_widget.get_role(item) if item is not None else None
+            if not role or role.get("kind") != "node":
+                self.append("!! 調整するステップを一覧から選択してください"
+                             "(then:/else:の見出し行は選べません)")
+                return
+            if role["node"].get("type") != "tap":
+                self.append("!! [if]の行自体はマスク調整の対象外です"
+                             "(判定条件は「分岐を編集」画面から選び直してください)")
+                return
+            target = role["path"]
+        else:
+            row = list_widget.currentRow()
+            if row < 0:
+                self.append("!! 調整する項目を一覧から選択してください")
+                return
+            target = row
         try:
-            dlg = MaskEditorDialog(name, kind, row, self)
+            dlg = MaskEditorDialog(name, kind, target, self)
         except Exception as e:
             self.append(f"!! マスク調整画面の準備に失敗: {e}")
             return
@@ -3521,6 +3598,7 @@ class MainWindow(QtWidgets.QWidget):
     def refresh_history(self):
         name = self.cmb_recipe.currentText().strip()
         self.list_steps.clear()
+        self.list_steps.reset_roles()
         self.list_popups.clear()
         self.tbl_rank.setRowCount(0)
         self.list_failures.clear()
@@ -3549,13 +3627,11 @@ class MainWindow(QtWidgets.QWidget):
                         item.setIcon(QtGui.QIcon(pix))
                 list_widget.addItem(item)
 
-            for i, s in enumerate(data.get("steps", []), 1):
-                # "context"を優先し、無い(古い形式の)レシピはインデックスから
-                # 組み立てる方式にフォールバックする。並び替え後はインデックスと
-                # ファイル名の番号が一致しなくなるため、"context"が信頼できる
-                ctx_name = s.get("context") or f"context_{i:02d}.png"
-                add_thumb_item(self.list_steps, f"{i}. {s.get('label', '?')}",
-                               d / ctx_name)
+            # steps は if/else を含む木構造なので、分岐編集画面と同じ
+            # NodeTreeBuilder で(読み取り専用として)ツリー表示する。popups は
+            # 常にフラットな配列のままなので、従来通りサムネイル付きの
+            # 単純な一覧のままでよい
+            NodeTreeBuilder(self.list_steps, d, editable=False).build(data.get("steps", []))
             for i, p in enumerate(data.get("popups", []), 1):
                 ctx_name = p.get("context") or f"context_popup_{i:02d}.png"
                 add_thumb_item(self.list_popups, f"P{i}. {p.get('label', '?')}",
@@ -3563,7 +3639,8 @@ class MainWindow(QtWidgets.QWidget):
             if not data.get("popups"):
                 self.list_popups.addItem("(共通ポップアップは未登録です)")
         else:
-            self.list_steps.addItem("(このレシピはまだ記録されていません)")
+            self.list_steps.addTopLevelItem(
+                QtWidgets.QTreeWidgetItem(["(このレシピはまだ記録されていません)"]))
 
         failures = core.load_failures(name)
         # 「よく止まる箇所」のランキングは、従来通り実際の失敗(タイムアウト・
