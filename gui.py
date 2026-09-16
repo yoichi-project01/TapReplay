@@ -16,6 +16,7 @@ Android 端末の画面操作を記録し、あとから再生する汎用ツー
 """
 
 import io
+import re
 import json
 import time
 import shutil
@@ -439,8 +440,16 @@ class RecorderDialog(QtWidgets.QDialog):
         self.list_steps_edit.blockSignals(True)
         self.list_steps_edit.clear()
         for s in self.steps:
-            item = QtWidgets.QListWidgetItem(s["label"])
-            item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+            # self.stepsはルート階層のみのフラットなリストだが、続きから記録
+            # する既存レシピがif/elseを含む場合、ルート階層にifノードが
+            # そのまま混ざって並ぶことがある(【if/elseを含むレシピの続きから
+            # 記録】参照)。ifノードはこの画面からは中身を編集できない
+            # (テンプレート・座標を持たないため撮り直しの対象にもできない)
+            # ので、[if]と分かる表示にした上で編集不可にする
+            is_if = s.get("type", "tap") == "if"
+            item = QtWidgets.QListWidgetItem(f"[if] {s.get('label', '?')}" if is_if else s["label"])
+            if not is_if:
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
             item.setData(QtCore.Qt.UserRole, s)
             self.list_steps_edit.addItem(item)
         self.list_steps_edit.blockSignals(False)
@@ -478,6 +487,13 @@ class RecorderDialog(QtWidgets.QDialog):
         new_label = item.text().strip()
         if new_label:
             self.steps[idx]["label"] = new_label
+            # on_steps_reordered()はitem.data(UserRole)に積んだスナップショットから
+            # self.stepsを再構築する。PySide6はsetData(UserRole, dict)を渡すと
+            # 中身を複製するだけで元のオブジェクトとは別物になる(実測で確認済み、
+            # NodeTreeBuilder/BlockTreeWidgetの側テーブルを使っている理由と同じ)ため、
+            # ここでラベルを書き換えた直後にitem側のスナップショットも更新しておかないと、
+            # このあと並び替えただけで名前変更が巻き戻ってしまう
+            item.setData(QtCore.Qt.UserRole, self.steps[idx])
             self._dirty = True
             self._msg(f"step{idx + 1} の名前を「{new_label}」に変更しました")
         else:
@@ -514,6 +530,18 @@ class RecorderDialog(QtWidgets.QDialog):
         if not prev_steps and not prev_popups:
             return
 
+        # ルート階層にifノードが1つでもあれば、このレシピは分岐を含む
+        # (ifの中(then/else)にさらにifがあってもルート階層のこのifノード
+        # 自体で判定できるので、ここでは深く辿る必要はない)
+        has_branches = any(s.get("type") == "if" for s in prev_steps)
+        branch_note = (
+            "\n\nこのレシピには分岐(if)が含まれています。新しく記録する"
+            "ステップは、既存の分岐構造を保ったまま一番後ろに追加されます"
+            "(あとで「分岐を編集」画面から好きな位置へ移動できます)。"
+            "分岐の中のステップ自体は、この記録画面からは撮り直せません"
+            "(「分岐を編集」画面や、記録内容タブの「マスクを調整」を"
+            "使ってください)。" if has_branches else "")
+
         if auto_continue:
             resp = QtWidgets.QMessageBox.Yes
         else:
@@ -523,18 +551,30 @@ class RecorderDialog(QtWidgets.QDialog):
                 f"・{len(prev_popups)}件の共通ポップアップが記録されています。\n\n"
                 "「はい」: プログラムが止まった続きから追加記録する\n"
                 "「いいえ」: 最初からやり直す（「保存して閉じる」を押すまでは"
-                "元の記録は消えません。キャンセルすれば元のまま残ります）",
+                "元の記録は消えません。キャンセルすれば元のまま残ります。"
+                "分岐(if)を含む場合、その構造もファイルもまとめて消えます）"
+                + branch_note,
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.Yes,
             )
         if resp == QtWidgets.QMessageBox.Yes:
             self.steps = prev_steps
             self.popups = prev_popups
-            self._history = ([("step", s) for s in self.steps] +
-                              [("popup", p) for p in self.popups])
+            # 「一つ戻す」の対象は、このセッションで新しく記録した項目だけに
+            # 限定する(空で始める)。_historyに元々あった項目まで含めると、
+            # 記録した順番とは無関係な順序(steps全部→popups全部)でpopされて
+            # しまい、一つ戻すだけで無関係な既存ステップを誤って消してしまう。
+            # if/elseを含むレシピでは、これによってthen/elseの中身ごと
+            # ブロック全体が消えてしまう恐れがあり被害が大きいため、
+            # 既存の項目は「一つ戻す」の対象から外す(消したければ
+            # 「分岐を編集」画面や記録内容タブの削除機能を使う)
+            self._history = []
             self._msg(
                 f"続きから記録します（ステップ{len(prev_steps)}件・"
-                f"共通ポップアップ{len(prev_popups)}件を読み込み済み）")
+                f"共通ポップアップ{len(prev_popups)}件を読み込み済み）"
+                + ("\n※分岐(if)を含みます。新しいステップは一番後ろに追加され、"
+                   "「一つ戻す」は今回新しく記録した項目にしか使えません"
+                   if has_branches else ""))
             # この時点では未接続でself.sw/shが分からないため、比較は
             # 接続完了後(_on_connected)に行う。ここでは値を覚えておくだけ
             self._loaded_device_size = data.get("device_size")
@@ -551,7 +591,9 @@ class RecorderDialog(QtWidgets.QDialog):
                     self._purge_on_save.add(f.name)
             self._msg(
                 "最初からやり直します。「保存して閉じる」を押すまで元の記録は"
-                "残ります（キャンセルすれば元のまま使えます）")
+                "残ります（キャンセルすれば元のまま使えます）"
+                + ("\n※分岐(if)を含んでいたレシピです。保存すると、その分岐"
+                   "構造とファイルもまとめて失われます" if has_branches else ""))
 
     def _msg(self, m):
         self.log.appendPlainText(m)
@@ -615,6 +657,11 @@ class RecorderDialog(QtWidgets.QDialog):
         pen = QtGui.QPen(QtGui.QColor(255, 0, 0)); pen.setWidth(3)
         painter.setPen(pen)
         for i, s in enumerate(self.steps, 1):
+            if s.get("type", "tap") != "tap":
+                # ifノードはタップ座標(x/y)を持たない(続きから記録している
+                # 分岐入りレシピでルート階層に混ざっていることがある)ので、
+                # マーカーは描かずスキップする
+                continue
             x = int(s["x"] * self.scale); y = int(s["y"] * self.scale)
             painter.drawEllipse(QtCore.QPoint(x, y), 14, 14)
             painter.drawText(x + 16, y + 6, str(i))
@@ -629,6 +676,28 @@ class RecorderDialog(QtWidgets.QDialog):
         self.img.setFixedSize(pix.size())
         # 更新が終わったのでクリックを再度受け付ける
         self.img.setEnabled(True)
+
+    def _next_free_index(self, *prefixes):
+        """新しいステップ/共通ポップアップ用ファイル名の連番を決める。
+        self.steps/self.popupsの件数(len)ではなく、ディスク上に実際に
+        存在するファイルから「これまでに使われた最大の番号+1」を返す。
+
+        件数を使わない理由: if/elseを含むレシピを「続きから記録」すると、
+        ルート階層の件数(len(self.steps))は、分岐の中に隠れているステップの
+        分だけ実際に使われてきたファイル数より少なくなる(例: 5ステップ中
+        2つをifのthenにまとめると、ルートは4件になるが、ファイルは
+        既に5つ分使われている)。件数ベースで採番すると、その差分の分だけ
+        番号が若返り、次の新規ステップが既存の(分岐の中にある)ファイルと
+        同じ番号を再利用して上書きしてしまう。StructureEditorDialogでの
+        削除(JSONだけ消してファイルは残す)でも同様のズレが起こり得る"""
+        max_n = 0
+        for prefix in prefixes:
+            pattern = re.compile(re.escape(prefix) + r"(\d+)")
+            for f in self.dir.glob(f"{prefix}*.png"):
+                m = pattern.match(f.stem)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+        return max_n + 1
 
     def _capture_masked_template(self, rx, ry, w=None, h=None):
         """クリック位置(rx, ry)を中心に複数フレーム撮影し、マスク付きZNCC用の
@@ -772,7 +841,7 @@ class RecorderDialog(QtWidgets.QDialog):
             self._capture_masked_template(rx, ry, w, h)
 
         if self.ck_popup_mode.isChecked():
-            idx = len(self.popups) + 1
+            idx = self._next_free_index("popup_", "context_popup_", "mask_popup_")
             tpl = f"popup_{idx:02d}.png"
             ctx_name = f"context_popup_{idx:02d}.png"
             mask_name = f"mask_popup_{idx:02d}.png"
@@ -787,7 +856,7 @@ class RecorderDialog(QtWidgets.QDialog):
             self._history.append(("popup", new_item))
             self._msg(f"popup{idx}: ({rx},{ry}) → {tpl} (共通ポップアップとして記録)")
         else:
-            idx = len(self.steps) + 1
+            idx = self._next_free_index("step_", "context_", "mask_")
             tpl = f"step_{idx:02d}.png"
             ctx_name = f"context_{idx:02d}.png"
             mask_name = f"mask_{idx:02d}.png"
@@ -817,6 +886,12 @@ class RecorderDialog(QtWidgets.QDialog):
         実行される"""
         if not (0 <= idx < len(self.steps)):
             return
+        if self.steps[idx].get("type", "tap") != "tap":
+            # ifノードはtemplate/座標を持たないため撮り直せない
+            # (【if/elseを含むレシピの続きから記録】参照)
+            self._msg("!! [if]の行は撮り直せません(「分岐を編集」画面や"
+                       "記録内容タブの「マスクを調整」を使ってください)")
+            return
         if self._retake_step is not None:
             self._msg(
                 "!! 既に撮り直し待ちのステップがあります。先にそのボタンを"
@@ -836,7 +911,9 @@ class RecorderDialog(QtWidgets.QDialog):
         ショートカット起動用)。見つからない場合(名前変更・削除等)は、
         通常の記録ダイアログとして開いたままにし、その旨だけログに出す"""
         for i, s in enumerate(self.steps):
-            if s.get("label") == label:
+            # ifノードとラベルが偶然一致しても撮り直し対象にはしない
+            # (該当するtapノードが他になければ「見つからない」扱いにする)
+            if s.get("type", "tap") == "tap" and s.get("label") == label:
                 self.list_steps_edit.setCurrentRow(i)
                 self._arm_retake(i)
                 return
@@ -926,9 +1003,13 @@ class RecorderDialog(QtWidgets.QDialog):
         if self._purge_on_save:
             # 「最初からやり直す」で保留していた古いファイルのうち、
             # 新しい記録で使われなかったものだけをここで削除する
-            # (同じ番号を再利用したファイルは新しい内容で上書き済みなので残す)
-            keep = set()
-            for item in self.steps + self.popups:
+            # (同じ番号を再利用したファイルは新しい内容で上書き済みなので残す)。
+            # self.steps + self.popupsをそのまま浅く見るだけだと、if/elseの
+            # 中(then/else)にあるtapノードやifの条件画像が拾えず、
+            # まだ使われているファイルを「未使用」と誤判定して消してしまう
+            # 恐れがあるため、木構造を辿るcore.iter_referenced_imagesを使う
+            keep = set(core.iter_referenced_images(self.steps))
+            for item in self.popups:
                 keep.add(item.get("template"))
                 keep.add(item.get("context"))
                 keep.add(item.get("mask"))

@@ -444,6 +444,35 @@ def iter_tap_leaves(nodes):
             yield from iter_tap_leaves(node.get("body", []))
 
 
+def iter_referenced_images(nodes):
+    """steps(木構造)を深さ優先で辿り、参照されている画像ファイル名
+    (template/context/mask)を全て返すジェネレータ。tapノードの
+    template/context/maskと、ifノードのcondition内のtemplate/mask
+    (ifノード自体はcontextを持たない)の両方を対象にする。
+
+    「今のレシピで実際に使われているファイルを漏れなく把握する」ために
+    使う(RecorderDialogが、撮り直しや「最初からやり直す」で不要になった
+    古いファイルを削除する際、if/elseの中など木構造の奥に隠れている
+    ファイルを"未使用"と誤判定して消してしまわないようにするため)"""
+    for node in nodes:
+        ntype = node.get("type", "tap")
+        if ntype == "tap":
+            for key in ("template", "context", "mask"):
+                v = node.get(key)
+                if v:
+                    yield v
+        elif ntype == "if":
+            cond = node.get("condition", {})
+            for key in ("template", "mask"):
+                v = cond.get(key)
+                if v:
+                    yield v
+            yield from iter_referenced_images(node.get("then", []))
+            yield from iter_referenced_images(node.get("else", []))
+        elif ntype == "loop":
+            yield from iter_referenced_images(node.get("body", []))
+
+
 def get_node_by_path(steps, path):
     """steps(木構造)上の1ノードを、(トップレベルindex, "then"/"else",
     ブロック内index, ...) の形のpathから取り出す。行番号のような「その場限り
