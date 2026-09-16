@@ -9,8 +9,9 @@ venv/
 build/
 dist/
 
-# 記録データ（ユーザーごとに生成される）
+# 記録データ・設定（ユーザーごとに生成される）
 recipes/
+settings.ini
 
 # adb を同梱した場合
 adb.exe

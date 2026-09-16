@@ -39,6 +39,11 @@ TapReplay.exe には、以下の Python パッケージ(またはその一部)�
                    https://github.com/numpy/numpy)
   Pillow         - MIT-CMU License(PIL License、MIT系)
                    (https://github.com/python-pillow/Pillow)
+  windows-toasts - MIT License(Windowsのトースト通知に使用)
+                   (https://github.com/DatGuy1/Windows-Toasts)
+  winrt-runtime 他 - MIT License(windows-toastsが使うWindows Runtime
+                   のPythonバインディング。pywinrtプロジェクト由来)
+                   (https://github.com/pywinrt/pywinrt)
 
 ============================================================
 Apache License 2.0 全文

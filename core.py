@@ -32,6 +32,10 @@ else:
 RECIPES = BASE / "recipes"
 RECIPES.mkdir(exist_ok=True)
 
+# GUIの設定(通知のON/OFFなど)の保存先。recipesと同様、exeのある場所を
+# 基準にする(exeフォルダごと配布・移動しても設定が一緒についてくるように)
+SETTINGS_PATH = BASE / "settings.ini"
+
 
 def _resolve_adb():
     """
@@ -156,6 +160,25 @@ def imwrite(path, img):
         return False
     path.write_bytes(buf.tobytes())
     return True
+
+
+def imread(path, flags=None):
+    """
+    cv2.imread の代わり。imwrite と同じ理由(Windowsで日本語などを含む
+    パスだとcv2.imreadはエラーも出さず静かにNoneを返す)で、
+    ファイル読み込み+imdecodeで代替する。
+
+    flags省略時はcv2.IMREAD_UNCHANGED相当(cv2.imreadの既定と同じ)。
+    ファイルが存在しない・読み込めない場合はNoneを返す(cv2.imreadと同じ)
+    """
+    path = pathlib.Path(path)
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    buf = np.frombuffer(data, dtype=np.uint8)
+    if flags is None:
+        flags = cv2.IMREAD_UNCHANGED
+    return cv2.imdecode(buf, flags)
 
 
 def crop(pil_img, cx, cy, w, h):
@@ -385,46 +408,71 @@ def _load_step_images(d, step, label):
 
     "method"キーを持たない古いレシピはccoeffとして扱い、マスクは
     読み込まない(既存レシピの再生を壊さないため)"""
-    g = cv2.imread(str(d / step["template"]), cv2.IMREAD_GRAYSCALE)
+    g = imread(d / step["template"], cv2.IMREAD_GRAYSCALE)
     if g is None:
         raise FileNotFoundError(f"{label}のテンプレートが読めません: {step['template']}")
     step["_gray"] = g
     step.setdefault("method", "ccoeff")
     mask_name = step.get("mask")
     if mask_name:
-        m = cv2.imread(str(d / mask_name), cv2.IMREAD_GRAYSCALE)
+        m = imread(d / mask_name, cv2.IMREAD_GRAYSCALE)
         if m is None:
             raise FileNotFoundError(f"{label}のマスクが読めません: {mask_name}")
         step["_mask"] = m
 
 
-def iter_tap_nodes(nodes):
-    """steps(木構造)を深さ優先で辿り、type:tap のノードだけを順番に返す
-    ジェネレータ。フェーズ0時点のレシピは全ノードがtapなので、これは
-    単純にnodesをそのまま返すのと同じ結果になる。
+# ifノードのcondition.kindとして対応しているもの。image_found=画像が
+# 見つかればthen、image_not_found=見つからなければthen(見つかれば
+# else)。フェーズ2以降で条件の種類を増やす場合はここに追加していく
+CONDITION_KINDS = ("image_found", "image_not_found")
 
-    if/loopノードの子ブロック(then/else/body)へ実際に潜って辿るのは
-    フェーズ1以降で実装する。どちらの枝に進むか・何回ループするかは
-    再生時の端末の画面を見て初めて決まる(条件判定は実行時の状態に
-    依存する)ため、ここで事前に一括展開することはできない。
-    このジェネレータはtapのみで構成されたレシピ専用であり、if/loopが
-    混ざったレシピは非対応として明示的にエラーにする(黙って無視したり
-    誤った順序で展開したりしない)。
 
-    load_recipe()でのテンプレート一括読み込みにのみ使う軽量ユーティリティ。
-    再生の実行順そのもの(どのノードを待ってタップするか)は、条件が
-    実行時の端末の状態に依存するため事前展開できない。そちらはCursorが
-    担う(このモジュール内で定義)"""
+def iter_tap_leaves(nodes):
+    """steps(木構造)を深さ優先で辿り、type:tapのノードだけを返す
+    ジェネレータ。if/loopには単に潜るだけで、実行順やcondition評価には
+    一切関与しない(実行順の決定はCursorの役目)。「レシピ内の全tapノードを
+    ネストを問わず一通り見る」ための診断・統計用途にのみ使うこと
+    (旧形式レシピ検出の警告、ステップ数の表示など)"""
     for node in nodes:
         ntype = node.get("type", "tap")
         if ntype == "tap":
             yield node
-        elif ntype in ("if", "loop"):
+        elif ntype == "if":
+            yield from iter_tap_leaves(node.get("then", []))
+            yield from iter_tap_leaves(node.get("else", []))
+        elif ntype == "loop":
+            yield from iter_tap_leaves(node.get("body", []))
+
+
+def _load_node_images(d, nodes, label):
+    """steps(木構造)を深さ優先で辿り、tapノードのテンプレート・マスクと、
+    ifノードのcondition画像を読み込む。then/elseへ実際に再帰する点が、
+    フェーズ0にあったiter_tap_nodes()(tap以外に出会うと即エラーにする
+    だけで潜らなかった)との違い。type未指定のノードはここでtapとして
+    補完する(setdefault)。ディスク上のファイルはload_recipe()の
+    呼び出し元が保存し直すまで書き換わらない"""
+    for node in nodes:
+        ntype = node.setdefault("type", "tap")
+        if ntype == "tap":
+            _load_step_images(d, node, label)
+        elif ntype == "if":
+            cond = node.get("condition")
+            if not cond:
+                raise ValueError(
+                    f"{label}: ifノード「{node.get('label', '?')}」に"
+                    "conditionがありません")
+            if cond.get("kind") not in CONDITION_KINDS:
+                raise ValueError(
+                    f"{label}: ifノード「{node.get('label', '?')}」の"
+                    f"condition kindが未対応です: {cond.get('kind')!r}")
+            _load_step_images(d, cond, f"{label}(条件)")
+            _load_node_images(d, node.get("then", []), label)
+            _load_node_images(d, node.get("else", []), label)
+        elif ntype == "loop":
             raise NotImplementedError(
-                f"type={ntype!r} の実行制御はフェーズ1以降で対応します"
-                "(条件評価が必要なため、ここでは未対応)")
+                "type='loop' の実行制御はフェーズ2以降で対応します")
         else:
-            raise ValueError(f"load_recipe: 未知のノードtypeです: {ntype!r}")
+            raise ValueError(f"{label}: 未知のノードtypeです: {ntype!r}")
 
 
 class Cursor:
@@ -445,41 +493,38 @@ class Cursor:
     あるブロックを最後まで実行し終えたら、current()が自動的に1段上の
     ブロックへ戻る(= ブロックの退出)。
 
-    フェーズ0時点のレシピは全ノードがルート直下のtapのみなので、
-    スタックは常に1段のまま([ [root_nodes, index] ])で、ルートを
-    順番に進むだけになり、挙動は従来のインデックス走査と一致する。
-    if/loopノードに実際に入る(then/else/bodyへpushする)処理は
-    フェーズ1で条件評価とあわせて実装する。それまでは、tap以外の
-    ノードに出会うとcurrent()がエラーにする(iter_tap_nodes()と同じ
-    考え方: 黙って無視したり誤った順序で展開したりしない)"""
+    Cursorはノードの中身(type)には一切関知しない。current()は今の
+    位置にあるノードをそのまま返すだけで、それがtapなのかifなのかの
+    判断・分岐処理は呼び出し側(PlayerThread)の役目。if条件の評価は
+    実行時の端末の画面を見て初めて決まる(実行時の状態に依存する)ため、
+    Cursorのような純粋なデータ構造の中では行えない。then/elseどちらの
+    枝へ実際に潜るか決まった後、呼び出し側がenter_block()を呼ぶ"""
 
     def __init__(self, root_nodes):
         self._stack = [[root_nodes, 0]]
         # advance()/advance_to_sibling()が一度でも呼ばれたか。
         # 「周回の最初のステップかどうか」の判定に使う(is_at_start参照)。
-        # ブロックへの出入り(current()内の自動pop、将来のenter_block)は
+        # ブロックへの出入り(current()内の自動pop、enter_block)は
         # 実行そのものではなく位置探しのナビゲーションなので、これには
         # 影響させない
         self._moved = False
 
     def current(self):
-        """今指しているtapノードを返す。全ノードを実行し終えていればNone"""
+        """今指しているノードをそのまま返す(type問わず)。全ノードを
+        実行し終えていればNone。tapかifか等の判断は呼び出し側で行うこと"""
         while self._stack:
             nodes, i = self._stack[-1]
             if i >= len(nodes):
                 # このブロックは最後まで実行し終えた → 1段上に戻る(退出)
                 self._stack.pop()
                 continue
-            node = nodes[i]
-            ntype = node.get("type", "tap")
-            if ntype == "tap":
-                return node
-            if ntype in ("if", "loop"):
-                raise NotImplementedError(
-                    f"type={ntype!r} の実行制御はフェーズ1以降で対応します"
-                    "(条件評価が必要なため、ここでは未対応)")
-            raise ValueError(f"Cursor: 未知のノードtypeです: {ntype!r}")
+            return nodes[i]
         return None
+
+    def depth(self):
+        """今何階層目のブロックにいるか(根が1)。実行トレースのログを
+        インデントする際に使う"""
+        return len(self._stack)
 
     def advance(self):
         """今指しているノードから1つ先(同じブロック内の次の兄弟)へ進む
@@ -511,31 +556,25 @@ class Cursor:
         しない)"""
         return not self._moved
 
-    def root_index(self):
-        """今いちばん外側のブロックで指しているインデックス(0始まり)。
-        フェーズ0はネストが無いためスタックは常に1段で、これは
-        『レシピの何番目のステップか』とそのまま一致する(ログ表示用)。
-        フェーズ1でif/loopの中に実際に入るようになったら、この値は
-        『その時点でルート直下にあるif/loopノード自体の位置』を指す
-        だけになり、ネストした中の細かい位置は表せなくなる。スキップ
-        探索のログにどう番号を出すかは、その時に改めて設計すること"""
-        return self._stack[0][1]
-
     def enter_block(self, nodes):
         """子ブロック(then/else/bodyなど)へ入る(スタックに1段積む=
-        ブロックの入場)。フェーズ1でif/loopの条件を評価した後に呼ぶ想定。
-        フェーズ0時点ではcurrent()がif/loopに出会うと先に例外を出すため、
-        この関数はまだどこからも呼ばれない"""
+        ブロックの入場)。if/loopの条件を評価し、どちらの枝に進むか
+        (または実行するかどうか)決まった後に呼ぶ。
+
+        呼び出し前に、今のブロックでの位置を1つ先に進めておく。こうして
+        おかないと、子ブロックの実行を終えて1段上に戻ってきたとき、
+        current()がif/loopノード自身を指したままになり、同じブロックへ
+        無限に入り直してしまう。この前進は実際に何かを実行したわけでは
+        なく、単に子ブロックへ潜るための位置合わせなので、is_at_start()
+        の判定(_moved)には影響させない"""
+        self._stack[-1][1] += 1
         self._stack.append([nodes, 0])
 
 
 def load_recipe(name):
     d = recipe_path(name)
     data = json.loads((d / "recipe.json").read_text(encoding="utf-8"))
-    for step in data["steps"]:
-        step.setdefault("type", "tap")
-    for step in iter_tap_nodes(data["steps"]):
-        _load_step_images(d, step, "ステップ")
+    _load_node_images(d, data["steps"], "ステップ")
     data.setdefault("popups", [])
     for popup in data["popups"]:
         _load_step_images(d, popup, "ポップアップ")

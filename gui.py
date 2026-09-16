@@ -19,6 +19,7 @@ import io
 import json
 import time
 import shutil
+import pathlib
 import datetime
 
 import cv2
@@ -26,6 +27,7 @@ import numpy as np
 from PySide6 import QtWidgets, QtCore, QtGui
 
 import core
+import notify
 
 # レシピ名はフォルダ名としてそのまま使われるため、パス区切りなどは禁止する
 INVALID_NAME_CHARS = '\\/:*?"<>|'
@@ -123,10 +125,55 @@ def groupbox_help(tip):
 
 # ============================================ クリックできる画像ラベル
 class ClickableLabel(QtWidgets.QLabel):
+    """画面プレビュー上のクリック/ドラッグを検出する。
+
+    その場でほぼ動かさずに離した場合はクリック(clicked)として扱い、従来
+    通り1点だけを渡す(切抜き範囲は呼び出し側の既定値=「切抜き幅/高さ」を
+    使う)。一定以上動かして離した場合はドラッグ(dragged)として扱い、
+    矩形の対角2点を渡す。
+
+    ドラッグ対応の理由: 既定サイズの自動切り抜きだと、アニメーション
+    (光の演出など)がかかった部分まで範囲に入ってしまい、動かない部分の
+    割合が少なくなって判定が安定しないことがある(実機で確認)。範囲を
+    自分で細かく選べれば、アニメーションのかかっていない安定した部分
+    だけを狙って切り抜ける"""
     clicked = QtCore.Signal(int, int)
+    dragged = QtCore.Signal(int, int, int, int)  # x1, y1, x2, y2 (ラベル座標、正規化済み)
+
+    # これ未満の移動量はクリックとして扱う(意図せず数ピクセルだけ
+    # 動いてしまった場合の誤操作防止)
+    DRAG_THRESHOLD_PX = 6
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._press_pos = None
+        self._rubber_band = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self)
 
     def mousePressEvent(self, e):
-        self.clicked.emit(int(e.position().x()), int(e.position().y()))
+        self._press_pos = e.position().toPoint()
+        self._rubber_band.setGeometry(QtCore.QRect(self._press_pos, QtCore.QSize()))
+        self._rubber_band.show()
+
+    def mouseMoveEvent(self, e):
+        if self._press_pos is None:
+            return
+        rect = QtCore.QRect(self._press_pos, e.position().toPoint()).normalized()
+        self._rubber_band.setGeometry(rect)
+
+    def mouseReleaseEvent(self, e):
+        if self._press_pos is None:
+            return
+        self._rubber_band.hide()
+        release_pos = e.position().toPoint()
+        dx = abs(release_pos.x() - self._press_pos.x())
+        dy = abs(release_pos.y() - self._press_pos.y())
+        if dx < self.DRAG_THRESHOLD_PX and dy < self.DRAG_THRESHOLD_PX:
+            self.clicked.emit(self._press_pos.x(), self._press_pos.y())
+        else:
+            x1, y1 = self._press_pos.x(), self._press_pos.y()
+            x2, y2 = release_pos.x(), release_pos.y()
+            self.dragged.emit(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        self._press_pos = None
 
 
 # ==================================== ドラッグ&ドロップで並び替え可能な一覧
@@ -239,12 +286,14 @@ class RecorderDialog(QtWidgets.QDialog):
         self.img = ClickableLabel()
         self.img.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
         self.img.clicked.connect(self.on_click)
+        self.img.dragged.connect(self.on_drag)
         root.addWidget(self.img)
 
         # 右: 操作パネル
         side = QtWidgets.QVBoxLayout()
         side.addWidget(QtWidgets.QLabel(
-            "画面の上で、操作したいボタンを\n実行したい順にクリック"))
+            "画面の上で、操作したいボタンを\n実行したい順にクリック\n"
+            "(範囲を自分で決めたいときはドラッグ)"))
         self.ck_send = QtWidgets.QCheckBox("クリックを端末にも送る(画面を進める)")
         self.ck_send.setChecked(True)
         side.addWidget(with_help(
@@ -581,14 +630,21 @@ class RecorderDialog(QtWidgets.QDialog):
         # 更新が終わったのでクリックを再度受け付ける
         self.img.setEnabled(True)
 
-    def _capture_masked_template(self, rx, ry):
+    def _capture_masked_template(self, rx, ry, w=None, h=None):
         """クリック位置(rx, ry)を中心に複数フレーム撮影し、マスク付きZNCC用の
         テンプレート・マスク・自動しきい値・確認用画像(ctx)を作る。
+
+        w, h: 切り抜きサイズ。省略時は「切抜き幅/高さ」欄の値
+        (self.tpl_w/self.tpl_h)を使う。矩形ドラッグで範囲を自分で
+        指定した場合はここに実際のドラッグサイズが渡される
 
         新規ステップ/共通ポップアップの記録と、既存ステップの撮り直しの
         両方から呼ばれる共通処理(【撮り直し機能】追加にあたり on_click から
         切り出した)。戻り値: (tpl_gray, mask, dx, dy, computed_threshold, ctx)
         """
+        tpl_w = w if w is not None else self.tpl_w
+        tpl_h = h if h is not None else self.tpl_h
+
         # 端末にタップを送ると画面が進んでしまうため、この撮影は必ず
         # 「クリックを端末にも送る」の送信より前に行う
         self.img.setEnabled(False)
@@ -608,14 +664,14 @@ class RecorderDialog(QtWidgets.QDialog):
 
         ctx = cv2.cvtColor(np.array(frames[0]), cv2.COLOR_RGB2BGR)
         cv2.rectangle(ctx,
-                      (rx - self.tpl_w // 2, ry - self.tpl_h // 2),
-                      (rx + self.tpl_w // 2, ry + self.tpl_h // 2),
+                      (rx - tpl_w // 2, ry - tpl_h // 2),
+                      (rx + tpl_w // 2, ry + tpl_h // 2),
                       (0, 0, 255), 4)
 
         dx = dy = 0
         crops_gray = []
         for f in frames:
-            crop_img, (dx, dy) = core.crop(f, rx, ry, self.tpl_w, self.tpl_h)
+            crop_img, (dx, dy) = core.crop(f, rx, ry, tpl_w, tpl_h)
             crops_gray.append(core.to_gray(crop_img).astype(np.float32))
         stack = np.stack(crops_gray)
         mask = (stack.std(axis=0) < MASK_STD_THRESHOLD).astype(np.uint8) * 255
@@ -686,16 +742,34 @@ class RecorderDialog(QtWidgets.QDialog):
     def on_click(self, lx, ly):
         if self.pil is None:
             return
-        self._dirty = True
         rx = int(lx / self.scale)
         ry = int(ly / self.scale)
+        self._handle_capture_point(rx, ry)
+
+    def on_drag(self, lx1, ly1, lx2, ly2):
+        """矩形ドラッグで切り抜き範囲を自分で指定した場合。既定の
+        「切抜き幅/高さ」は使わず、ドラッグした矩形のサイズをそのまま使う"""
+        if self.pil is None:
+            return
+        rx1, ry1 = int(lx1 / self.scale), int(ly1 / self.scale)
+        rx2, ry2 = int(lx2 / self.scale), int(ly2 / self.scale)
+        w = max(8, abs(rx2 - rx1))
+        h = max(8, abs(ry2 - ry1))
+        rx = (rx1 + rx2) // 2
+        ry = (ry1 + ry2) // 2
+        self._handle_capture_point(rx, ry, w, h)
+
+    def _handle_capture_point(self, rx, ry, w=None, h=None):
+        """on_click/on_drag共通の処理。クリック(w=h=None)なら既定サイズ、
+        ドラッグならそのサイズで撮影する"""
+        self._dirty = True
 
         if self._retake_step is not None:
-            self._do_retake(rx, ry)
+            self._do_retake(rx, ry, w, h)
             return
 
         tpl_gray, mask, dx, dy, computed_threshold, ctx = \
-            self._capture_masked_template(rx, ry)
+            self._capture_masked_template(rx, ry, w, h)
 
         if self.ck_popup_mode.isChecked():
             idx = len(self.popups) + 1
@@ -777,7 +851,7 @@ class RecorderDialog(QtWidgets.QDialog):
             return
         self._arm_retake(idx)
 
-    def _do_retake(self, rx, ry):
+    def _do_retake(self, rx, ry, w=None, h=None):
         step = self._retake_step
         self._retake_step = None
         idx = self._find_step_index(step)
@@ -790,7 +864,7 @@ class RecorderDialog(QtWidgets.QDialog):
             return
 
         tpl_gray, mask, dx, dy, computed_threshold, ctx = \
-            self._capture_masked_template(rx, ry)
+            self._capture_masked_template(rx, ry, w, h)
 
         # 差し替え前の古いファイルは、保存されるまで削除しない
         # (「最初からやり直す」の_purge_on_saveと同じ考え方に合流させる。
@@ -884,6 +958,1008 @@ class RecorderDialog(QtWidgets.QDialog):
         self.accept()
 
 
+# ================================================== 分岐構造(if/else)編集
+# if の入れ子はこの画面からは深さMAX_NEST_DEPTHまでしか作れない(警告では
+# なく制限)。深くネストしたレシピが期待通り動かなかったとき、現状の
+# ツールには原因を切り分ける手段が無いため。JSONを直接編集すれば
+# この制限を超えたレシピを作ること自体は可能(再生エンジン側は深さを
+# 一切気にしない。core.Cursorのdocstring参照)
+MAX_NEST_DEPTH = 3
+
+
+class BlockTreeWidget(QtWidgets.QTreeWidget):
+    """分岐構造編集用のツリー。ドラッグ&ドロップは同一階層(同じ親)内の
+    並び替えに限定し、階層をまたぐ移動(別のブロックの中へ入れる/外へ出す)
+    はここでは実装しない(フェーズ1aの範囲外)。
+
+    RecorderDialogのReorderableListWidgetと同じ理由(PySide6 6.11で確認)
+    で、InternalMoveでの並び替え中はQt内部の実装(行の挿入→削除)により
+    itemChangedが「移動前の行」を指したまま一時的に発火することがある。
+    これをitemChanged側で見分けるのは難しいため、dropEventの開始～終了を
+    droppingフラグで明示し、ハンドラ側でその間は無視できるようにする
+    (ツリー表示でも同じ形で起こり得るため、最初からガードを入れておく)"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.dropping = False
+        # id(item) -> role辞書 の側テーブル。PySide6はQTreeWidgetItem.setData/
+        # data(..., UserRole)にPythonのdictを渡すとQVariant経由で中身が複製され、
+        # 元のオブジェクトと同一性(is)が保たれない(実測で確認)。そのため
+        # ノードやif_nodeへの参照を保持するroleは、Qt側のデータストレージでは
+        # なくこちらの側テーブルで管理する(setData自体は一切使わない)
+        self._roles = {}
+        self.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+    def set_role(self, item, role):
+        self._roles[id(item)] = role
+
+    def get_role(self, item):
+        return self._roles.get(id(item))
+
+    def reset_roles(self):
+        """clear()等で古いアイテムが破棄される前に呼ぶこと。id()はPythonの
+        ラッパーオブジェクトの生存期間中しか一意性を保証しないため、
+        再構築のたびに古いエントリを確実に捨てる"""
+        self._roles = {}
+
+    def dropEvent(self, event):
+        dragged = self.selectedItems()
+        if not dragged:
+            event.ignore()
+            return
+        dragged_parent = dragged[0].parent()
+        for it in dragged:
+            # 複数選択がそもそも別の階層にまたがっている、または
+            # then:/else:見出し行そのものが混ざっている場合は拒否
+            if it.parent() is not dragged_parent:
+                event.ignore()
+                return
+            role = self.get_role(it)
+            if not role or role.get("kind") != "node":
+                event.ignore()
+                return
+        indicator = self.dropIndicatorPosition()
+        if indicator == QtWidgets.QAbstractItemView.OnItem:
+            # ドロップ先の「子になる」動作(=階層をまたぐ)なので拒否
+            event.ignore()
+            return
+        target_item = self.itemAt(event.position().toPoint())
+        target_parent = target_item.parent() if target_item is not None else None
+        if target_parent is not dragged_parent:
+            event.ignore()
+            return
+        self.dropping = True
+        try:
+            super().dropEvent(event)
+        finally:
+            self.dropping = False
+
+
+class ConditionPickerDialog(QtWidgets.QDialog):
+    """ifの条件として使う画像を選ぶ画面。フェーズ1a時点では新規撮影はせず、
+    既に撮影済みのステップのtemplate/mask/method/thresholdをそのまま
+    流用する(端末には一切接続しない)"""
+
+    def __init__(self, recipe_dir, steps, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("条件画像を選択")
+        self.resize(420, 520)
+        self.recipe_dir = recipe_dir
+        self._extra_result = None  # 失敗履歴から作った場合の合成ステップ
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            "条件として使う画像(既に撮影済みのステップ)を選んでください:"))
+
+        self.list = QtWidgets.QListWidget()
+        self.list.setIconSize(QtCore.QSize(48, 48))
+        for step in steps:
+            item = QtWidgets.QListWidgetItem(step.get("label", "?"))
+            ctx = step.get("context")
+            if ctx:
+                path = recipe_dir / ctx
+                if path.exists():
+                    pix = QtGui.QPixmap(str(path))
+                    if not pix.isNull():
+                        pix = pix.scaled(48, 48, QtCore.Qt.KeepAspectRatio,
+                                          QtCore.Qt.SmoothTransformation)
+                        item.setIcon(QtGui.QIcon(pix))
+            item.setData(QtCore.Qt.UserRole, step)
+            self.list.addItem(item)
+        v.addWidget(self.list, 1)
+
+        b_from_failure = QtWidgets.QPushButton("失敗履歴の画像から選ぶ...")
+        b_from_failure.clicked.connect(self.on_pick_from_failure)
+        v.addWidget(with_help(
+            b_from_failure,
+            "既存ステップの画像ではなく、失敗履歴(または繰り返しポップアップ)の"
+            "スクリーンショットからドラッグで範囲を選び、それを条件にします。"
+            "単一の静止画からの作成のため、判定範囲は全域有効(旧ccoeff相当)"
+            "になります。"))
+
+        v.addWidget(help_label(
+            "判定条件",
+            "「見つかったらthen」: 選んだ画像が画面に見つかったときthenを"
+            "実行します。「見つからなかったらthen」: 見つからなかったときに"
+            "thenを実行します(例: 通常あるはずのボタンが無いことを検知したい場合)。"
+            "いずれの場合もelseは今は空です(フェーズ1bで対応します)。"))
+        self.rb_found = QtWidgets.QRadioButton("見つかったら then")
+        self.rb_found.setChecked(True)
+        self.rb_not_found = QtWidgets.QRadioButton("見つからなかったら then")
+        v.addWidget(self.rb_found)
+        v.addWidget(self.rb_not_found)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        v.addWidget(btns)
+
+    def on_pick_from_failure(self):
+        name = self.recipe_dir.name
+        failures = core.load_failures(name)
+        if not failures:
+            QtWidgets.QMessageBox.information(
+                self, "失敗履歴がありません", "このレシピにはまだ失敗履歴がありません。")
+            return
+        labels = [
+            f"{f.get('ts', '?')}  "
+            f"{f.get('reason', f.get('popup_label', ''))[:40]}"
+            for f in failures
+        ]
+        chosen, ok = QtWidgets.QInputDialog.getItem(
+            self, "失敗履歴を選択", "元にする失敗履歴を選んでください:", labels, 0, False)
+        if not ok:
+            return
+        entry = failures[labels.index(chosen)]
+        fname = entry.get("screenshot")
+        if not fname:
+            QtWidgets.QMessageBox.warning(self, "画像がありません", "この履歴にはスクリーンショットがありません。")
+            return
+        image_path = self.recipe_dir / fname
+        if not image_path.exists():
+            QtWidgets.QMessageBox.warning(self, "画像が見つかりません", str(fname))
+            return
+        try:
+            result = ScreenCropDialog.pick(
+                image_path, title="条件にする範囲を選択", parent=self)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "読み込み失敗", str(e))
+            return
+        if result is None:
+            return
+        # 条件はtemplate/maskだけを使い、タップ位置(cx,cy,dx,dy)は使わない
+        tpl_gray, mask, _cx, _cy, _dx, _dy = result
+        ts = datetime.datetime.now().strftime("%H%M%S")
+        tpl_name = f"cond_from_failure_{ts}.png"
+        mask_name = f"cond_from_failure_{ts}_mask.png"
+        core.imwrite(self.recipe_dir / tpl_name, tpl_gray)
+        core.imwrite(self.recipe_dir / mask_name, mask)
+        self._extra_result = {
+            "label": f"(失敗履歴より){entry.get('ts', '')}",
+            "template": tpl_name, "mask": mask_name,
+            "method": "masked_zncc", "threshold": 0.85,
+        }
+        self.accept()
+
+    def result_value(self):
+        if self._extra_result is not None:
+            kind = "image_found" if self.rb_found.isChecked() else "image_not_found"
+            return self._extra_result, kind
+        item = self.list.currentItem()
+        if item is None:
+            return None
+        step = item.data(QtCore.Qt.UserRole)
+        kind = "image_found" if self.rb_found.isChecked() else "image_not_found"
+        return step, kind
+
+    @staticmethod
+    def pick(parent, recipe_dir, steps):
+        if not steps:
+            QtWidgets.QMessageBox.warning(
+                parent, "選べる画像がありません",
+                "条件に使えるステップがまだありません。先に記録画面で"
+                "ステップを記録してください。")
+            return None
+        dlg = ConditionPickerDialog(recipe_dir, steps, parent)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        result = dlg.result_value()
+        if result is None:
+            QtWidgets.QMessageBox.warning(parent, "未選択", "画像を選んでください")
+            return None
+        return result
+
+
+class StructureEditorDialog(QtWidgets.QDialog):
+    """記録済みレシピの分岐構造(if/else)を編集する画面。RecorderDialog
+    (記録画面)とは完全に別の画面で、端末には一切接続しない(サムネイルは
+    記録済みのcontext画像を読むだけ)。記録画面のコードは一切変更しない。
+
+    フェーズ1a時点でできること:
+    - 記録済みのステップ一覧をサムネイル付きツリーで表示
+    - 同じ階層で連続選択した範囲を、ifのthenとしてまとめる
+      (条件画像は既に撮影済みのステップから選ぶ。新規撮影はしない)
+    - elseは空のまま(フェーズ1bで実機からの追加記録に対応)
+    - ドラッグ&ドロップは同じ階層内の並び替えのみ(階層をまたぐ移動は
+      フェーズ1aの範囲外)
+    - ifブロックの解除(elseが空の場合のみ、thenの中身を親階層に戻す)
+    - 入れ子は最大MAX_NEST_DEPTH階層(この画面からはそれ以上作れない)"""
+
+    def __init__(self, name, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self.recipe_dir = core.recipe_path(name)
+        self.setWindowTitle(f"分岐を編集: {name}")
+        self.resize(760, 620)
+        self._dirty = False
+
+        self.data = self._load_data()
+
+        root = QtWidgets.QHBoxLayout(self)
+
+        self.tree = BlockTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setIconSize(QtCore.QSize(48, 48))
+        self.tree.itemChanged.connect(self.on_item_changed)
+        self.tree.model().rowsMoved.connect(self._on_rows_moved)
+        root.addWidget(self.tree, 1)
+
+        side = QtWidgets.QVBoxLayout()
+        side.addWidget(help_label(
+            "分岐構造の編集",
+            "記録済みのステップ一覧をツリーで表示します。ダブルクリックで"
+            "名前を変更、ドラッグ&ドロップで同じ階層内の並び替えができます。"))
+
+        b_make_if = QtWidgets.QPushButton("選択範囲を if の then にする")
+        b_make_if.clicked.connect(self.on_make_if)
+        side.addWidget(with_help(
+            b_make_if,
+            "同じ階層で連続して選んだステップを、ifブロックのthen(条件が"
+            "成立したときに実行する側)としてまとめます。条件画像は既に"
+            f"撮影済みのステップから選びます。入れ子は{MAX_NEST_DEPTH}階層"
+            "までです(これを超える操作はこの画面からはできません)。"))
+
+        b_unblock = QtWidgets.QPushButton("選択した if ブロックを解除")
+        b_unblock.clicked.connect(self.on_unblock)
+        side.addWidget(with_help(
+            b_unblock,
+            "選んだifブロックを外し、thenの中身をそのまま親の階層に戻します。"
+            "elseに中身があるifはこの画面からは解除できません。"))
+
+        b_delete = QtWidgets.QPushButton("選択した項目を削除")
+        b_delete.setStyleSheet("color: #b00000;")
+        b_delete.clicked.connect(self.on_delete_selected)
+        side.addWidget(with_help(
+            b_delete,
+            "選んだステップ・ifブロック(中身ごと)を削除します。複数選択可。"
+            "元に戻せません(保存するまでは反映されないので、間違えたら"
+            "保存せずに閉じれば取り消せます)。テンプレート画像などのファイル"
+            "自体は残ります(他から参照されている可能性があるため)。"))
+
+        side.addStretch(1)
+
+        b_save = QtWidgets.QPushButton("保存")
+        b_save.clicked.connect(self.save)
+        side.addWidget(b_save)
+        b_close = QtWidgets.QPushButton("閉じる")
+        b_close.clicked.connect(self.close)
+        side.addWidget(b_close)
+
+        root.addLayout(side)
+
+        self._rebuild_tree()
+
+    # ---------------------------------------------------------- データ入出力
+    def _load_data(self):
+        path = self.recipe_dir / "recipe.json"
+        if not path.exists():
+            return {"steps": [], "popups": []}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.setdefault("steps", [])
+        data.setdefault("popups", [])
+        self._normalize_types(data["steps"])
+        return data
+
+    def _normalize_types(self, nodes):
+        """type未指定のノードをtapとして補完する(load_recipeの
+        setdefaultと同じ考え方)。ディスク上のファイルは保存するまで
+        書き換えない(このメソッドはメモリ上のself.dataだけを触る)"""
+        for node in nodes:
+            ntype = node.setdefault("type", "tap")
+            if ntype == "if":
+                node.setdefault("condition", {})
+                self._normalize_types(node.setdefault("then", []))
+                self._normalize_types(node.setdefault("else", []))
+
+    def save(self):
+        core.save_recipe(self.name, self.data)
+        self._dirty = False
+        QtWidgets.QMessageBox.information(self, "保存しました", f"「{self.name}」を保存しました")
+
+    def closeEvent(self, event):
+        if self._dirty:
+            resp = QtWidgets.QMessageBox.question(
+                self, "保存されていない変更があります",
+                "保存せずに閉じますか？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if resp != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
+        event.accept()
+
+    # ---------------------------------------------------------- ツリー構築
+    def _thumb_icon(self, context_name):
+        if not context_name:
+            return None
+        path = self.recipe_dir / context_name
+        if not path.exists():
+            return None
+        pix = QtGui.QPixmap(str(path))
+        if pix.isNull():
+            return None
+        pix = pix.scaled(48, 48, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        return QtGui.QIcon(pix)
+
+    def _rebuild_tree(self):
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        self.tree.reset_roles()
+        self._build_container(None, self.data["steps"], depth=1)
+        self.tree.expandAll()
+        self.tree.blockSignals(False)
+
+    def _build_container(self, parent_item, nodes, depth):
+        for node in nodes:
+            ntype = node.setdefault("type", "tap")
+            if ntype == "if":
+                item = self._make_if_item(node, depth)
+            else:
+                item = self._make_tap_item(node, depth)
+            if parent_item is None:
+                self.tree.addTopLevelItem(item)
+            else:
+                parent_item.addChild(item)
+
+    def _make_tap_item(self, node, depth):
+        item = QtWidgets.QTreeWidgetItem([node.get("label", "?")])
+        self.tree.set_role(item, {"kind": "node", "node": node, "depth": depth})
+        item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+        icon = self._thumb_icon(node.get("context"))
+        if icon is not None:
+            item.setIcon(0, icon)
+        return item
+
+    def _make_if_item(self, node, depth):
+        item = QtWidgets.QTreeWidgetItem([f"[if] {node.get('label', '?')}"])
+        self.tree.set_role(item, {"kind": "node", "node": node, "depth": depth})
+        item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+
+        then_header = self._make_branch_header(node, "then", depth + 1)
+        item.addChild(then_header)
+        self._build_container(then_header, node.setdefault("then", []), depth + 1)
+
+        else_header = self._make_branch_header(node, "else", depth + 1)
+        item.addChild(else_header)
+        else_list = node.setdefault("else", [])
+        if else_list:
+            self._build_container(else_header, else_list, depth + 1)
+        else:
+            placeholder = QtWidgets.QTreeWidgetItem(
+                ["(空。フェーズ1bで実機から追加記録できるようになります)"])
+            placeholder.setFlags(QtCore.Qt.ItemIsEnabled)
+            else_header.addChild(placeholder)
+        return item
+
+    def _make_branch_header(self, if_node, branch, depth):
+        item = QtWidgets.QTreeWidgetItem(["then:" if branch == "then" else "else:"])
+        self.tree.set_role(
+            item, {"kind": "branch_header", "if_node": if_node, "branch": branch, "depth": depth})
+        item.setFlags((item.flags() & ~QtCore.Qt.ItemIsSelectable) & ~QtCore.Qt.ItemIsDragEnabled)
+        font = item.font(0)
+        font.setItalic(True)
+        item.setFont(0, font)
+        return item
+
+    def _container_of(self, parent_item):
+        """parent_item(then:/else:見出し、またはNone=ルート)が表す
+        実データ上のリストを返す"""
+        if parent_item is None:
+            return self.data["steps"]
+        role = self.tree.get_role(parent_item)
+        return role["if_node"][role["branch"]]
+
+    # ---------------------------------------------------------- 編集操作
+    def on_item_changed(self, item, column):
+        if self.tree.dropping:
+            # ReorderableListWidgetと同じ理由: ドラッグ中の一時的な
+            # 誤発火を無視する(Cursor移動前の行を指したitemChangedが
+            # ツリー表示でも起こり得るため)
+            return
+        role = self.tree.get_role(item)
+        if not role or role.get("kind") != "node":
+            return
+        node = role["node"]
+        is_if = node.get("type") == "if"
+        prefix = "[if] "
+        text = item.text(0)
+        new_label = text[len(prefix):] if is_if and text.startswith(prefix) else text
+        new_label = new_label.strip()
+        if new_label:
+            node["label"] = new_label
+            self._dirty = True
+        else:
+            # 空にはできない→表示を元に戻す(itemChangedの再発火を避けるため
+            # blockSignalsで囲む)
+            self.tree.blockSignals(True)
+            item.setText(0, (prefix if is_if else "") + node.get("label", "?"))
+            self.tree.blockSignals(False)
+
+    def _on_rows_moved(self, *args):
+        """ドラッグ&ドロップ後、見た目の並び順を実データ(self.data)へ
+        反映する(BlockTreeWidget.dropEventにより同一階層内の移動しか
+        起こらないことは保証済み)"""
+
+        def walk(parent_item):
+            nodes = []
+            if parent_item is None:
+                count = self.tree.topLevelItemCount()
+                get_child = self.tree.topLevelItem
+            else:
+                count = parent_item.childCount()
+                get_child = parent_item.child
+            for i in range(count):
+                item = get_child(i)
+                role = self.tree.get_role(item)
+                if not role or role.get("kind") != "node":
+                    continue
+                node = role["node"]
+                nodes.append(node)
+                if node.get("type") == "if":
+                    for j in range(item.childCount()):
+                        header = item.child(j)
+                        hrole = self.tree.get_role(header)
+                        if hrole and hrole.get("kind") == "branch_header":
+                            node[hrole["branch"]] = walk(header)
+            return nodes
+
+        self.data["steps"] = walk(None)
+        self._dirty = True
+
+    def on_make_if(self):
+        items = [it for it in self.tree.selectedItems()
+                 if (self.tree.get_role(it) or {}).get("kind") == "node"]
+        if not items:
+            QtWidgets.QMessageBox.warning(self, "選択なし", "ifのthenにする範囲を選択してください")
+            return
+        parent = items[0].parent()
+        for it in items:
+            if it.parent() is not parent:
+                QtWidgets.QMessageBox.warning(self, "選択エラー", "同じ階層の範囲だけ選択してください")
+                return
+        if parent is None:
+            index_of = self.tree.indexOfTopLevelItem
+        else:
+            index_of = parent.indexOfChild
+        indices = sorted(index_of(it) for it in items)
+        if indices[-1] - indices[0] + 1 != len(indices):
+            QtWidgets.QMessageBox.warning(
+                self, "選択エラー", "連続した範囲だけ選択してください(間を飛ばせません)")
+            return
+
+        depth = self.tree.get_role(items[0])["depth"]
+        if depth + 1 > MAX_NEST_DEPTH:
+            QtWidgets.QMessageBox.warning(
+                self, "入れ子が深すぎます",
+                f"if の入れ子は{MAX_NEST_DEPTH}階層までです。これ以上深く"
+                "することはこの画面からはできません"
+                "(JSONを直接編集すれば可能ですが、動作の切り分けが難しくなります)。")
+            return
+
+        label, ok = QtWidgets.QInputDialog.getText(self, "分岐の名前", "この分岐(if)の名前:")
+        if not ok or not label.strip():
+            return
+
+        picked = ConditionPickerDialog.pick(
+            self, self.recipe_dir, list(core.iter_tap_leaves(self.data["steps"])))
+        if picked is None:
+            return
+        step, kind = picked
+        condition = {
+            "kind": kind,
+            "template": step["template"],
+            "method": step.get("method", "ccoeff"),
+            "threshold": step.get("threshold", 0.85),
+        }
+        if step.get("mask"):
+            condition["mask"] = step["mask"]
+
+        items_sorted = sorted(items, key=lambda it: index_of(it))
+        selected_nodes = [self.tree.get_role(it)["node"] for it in items_sorted]
+
+        container = self._container_of(parent)
+        start, end = indices[0], indices[-1]
+        if_node = {"type": "if", "label": label.strip(), "condition": condition,
+                   "then": selected_nodes, "else": []}
+        container[start:end + 1] = [if_node]
+        self._dirty = True
+        self._rebuild_tree()
+
+    def on_unblock(self):
+        items = [it for it in self.tree.selectedItems()
+                 if (self.tree.get_role(it) or {}).get("kind") == "node"]
+        if len(items) != 1:
+            QtWidgets.QMessageBox.warning(self, "選択エラー", "解除するifブロックを1つだけ選択してください")
+            return
+        item = items[0]
+        role = self.tree.get_role(item)
+        node = role["node"]
+        if node.get("type") != "if":
+            QtWidgets.QMessageBox.warning(self, "選択エラー", "ifブロックを選択してください")
+            return
+        if node.get("else"):
+            QtWidgets.QMessageBox.warning(
+                self, "解除できません",
+                "elseに中身があるifは、この画面からは解除できません"
+                "(then/elseどちらを残すか自動では判断できないため)。")
+            return
+        parent = item.parent()
+        container = self._container_of(parent)
+        idx = container.index(node)
+        container[idx:idx + 1] = node.get("then", [])
+        self._dirty = True
+        self._rebuild_tree()
+
+    def on_delete_selected(self):
+        items = [it for it in self.tree.selectedItems()
+                 if (self.tree.get_role(it) or {}).get("kind") == "node"]
+        if not items:
+            QtWidgets.QMessageBox.warning(self, "選択なし", "削除する項目を選択してください")
+            return
+        labels = [self.tree.get_role(it)["node"].get("label", "?") for it in items]
+        resp = QtWidgets.QMessageBox.question(
+            self, "削除の確認",
+            "以下を削除します(中身ごと、元に戻せません):\n"
+            + "\n".join(f"・{lbl}" for lbl in labels),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        for it in items:
+            role = self.tree.get_role(it)
+            node = role["node"]
+            container = self._container_of(it.parent())
+            # 内容が同じノードが複数あっても取り違えないよう、同一オブジェクト
+            # (is)で探す(list.remove/index は == で探すため、値が同じ別ノードを
+            # 誤って消してしまう恐れがある)
+            for i, n in enumerate(container):
+                if n is node:
+                    del container[i]
+                    break
+        self._dirty = True
+        self._rebuild_tree()
+
+
+# ================================================ オフラインでのマスク調整
+class MaskEditorDialog(QtWidgets.QDialog):
+    """すでに記録済みのステップ/共通ポップアップについて、端末に接続し
+    直さずに、保存済みのテンプレート画像に対して判定範囲(マスク)だけを
+    調整する画面。
+
+    記録・撮り直し(RecorderDialogの多フレーム撮影)は、その場で新しい
+    範囲の動き/静止を実測できる。これに対してこの画面は"すでに撮影済みの
+    画像"だけを使うので、新たに動き情報を取得することはできない。
+
+    記録時に保存されたcontext画像(端末の全体スクリーンショット1枚)を
+    表示に使い、画面のどこでも新しく範囲を選び直せるようにしている。
+    ただし元々の切り抜き範囲(複数フレームから動き/静止を実測済み)の
+    "外側"を選んだ場合、その部分は1枚の静止画像しかないため安定性が
+    未検証であり、判定に使う範囲として全面的に有効(旧ccoeff方式と同じ
+    扱い)として扱う。元の切り抜き範囲の"内側"は、実測済みのマスクを
+    そのまま引き継ぐ(狭めることはできるが、実測で不安定と分かった
+    画素を後から安定していたことにはできない)。しきい値は自動では
+    再計算せず(新しいフレームが無いため)、手動で調整できるようにする
+    だけに留める"""
+
+    # 大きな全体スクリーンショットをそのまま等倍で表示すると画面に収まらない
+    # ことが多いため、この高さに収まるよう縮小/拡大する目安
+    TARGET_DISPLAY_HEIGHT = 900
+
+    def __init__(self, name, kind, index, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self.kind = kind  # "steps" or "popups"
+        self.index = index
+        self.recipe_dir = core.recipe_path(name)
+        self.setWindowTitle(f"マスクを調整: {name}")
+
+        self.full_data = json.loads((self.recipe_dir / "recipe.json").read_text(encoding="utf-8"))
+        self.node = self.full_data[self.kind][self.index]
+
+        tpl_path = self.recipe_dir / self.node["template"]
+        orig_tpl_gray = core.imread(tpl_path, cv2.IMREAD_GRAYSCALE)
+        if orig_tpl_gray is None:
+            raise FileNotFoundError(f"テンプレート画像が読み込めません: {tpl_path}")
+        oh, ow = orig_tpl_gray.shape
+
+        mask_name = self.node.get("mask")
+        orig_mask = None
+        if mask_name:
+            orig_mask = core.imread(self.recipe_dir / mask_name, cv2.IMREAD_GRAYSCALE)
+        if orig_mask is None or orig_mask.shape != (oh, ow):
+            # マスク未設定(旧ccoeff形式)、または不整合な場合は「全域が
+            # 有効」として扱う
+            orig_mask = np.full((oh, ow), 255, dtype=np.uint8)
+
+        ctx_name = self.node.get("context")
+        ctx_path = self.recipe_dir / ctx_name if ctx_name else None
+        ctx_bgr = None
+        if ctx_path is not None and ctx_path.exists():
+            ctx_bgr = core.imread(ctx_path, cv2.IMREAD_COLOR)
+
+        if ctx_bgr is not None:
+            full_gray = cv2.cvtColor(ctx_bgr, cv2.COLOR_BGR2GRAY)
+            fh, fw = full_gray.shape
+            cx = int(self.node.get("x", fw // 2)) - int(self.node.get("dx", 0))
+            cy = int(self.node.get("y", fh // 2)) - int(self.node.get("dy", 0))
+            ox1 = max(0, min(cx - ow // 2, fw - ow))
+            oy1 = max(0, min(cy - oh // 2, fh - oh))
+            # 元の切り抜き範囲の外側は1枚の静止画しか無い(安定性が未検証)
+            # ため、テンプレート値はそのままの画素・マスクは全域有効とする。
+            # 内側だけは実測済みの多フレーム平均・マスクで上書きする
+            self.full_tpl = full_gray.copy()
+            self.full_tpl[oy1:oy1 + oh, ox1:ox1 + ow] = orig_tpl_gray
+            self.mask = np.full((fh, fw), 255, dtype=np.uint8)
+            self.mask[oy1:oy1 + oh, ox1:ox1 + ow] = orig_mask
+            self.active_rect = (ox1, oy1, ox1 + ow, oy1 + oh)
+        else:
+            # context画像が無い(古いレシピ等)場合は、従来通りテンプレート
+            # 単体だけを対象にする
+            self.full_tpl = orig_tpl_gray
+            self.mask = orig_mask.copy()
+            self.active_rect = (0, 0, ow, oh)
+
+        self._orig_mask = self.mask.copy()
+        self._orig_active_rect = self.active_rect
+
+        # 記録済みのdx/dyから、現在の座標系(full_tpl)上でのタップ位置を
+        # 逆算しておく。dx=dy=0(=範囲の中心をそのままタップ)の場合は
+        # tap_pos=Noneとし、「範囲の中心を使う」既定動作のまま扱う
+        node_dx = int(self.node.get("dx", 0))
+        node_dy = int(self.node.get("dy", 0))
+        if node_dx or node_dy:
+            rx1, ry1, rx2, ry2 = self.active_rect
+            rcx, rcy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
+            th, tw = self.full_tpl.shape
+            self.tap_pos = (max(0, min(rcx + node_dx, tw - 1)),
+                             max(0, min(rcy + node_dy, th - 1)))
+        else:
+            self.tap_pos = None
+        self._orig_tap_pos = self.tap_pos
+        self._dirty = False
+
+        fh, fw = self.full_tpl.shape
+        self.preview_scale = max(0.2, min(3.0, self.TARGET_DISPLAY_HEIGHT / fh))
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            f"「{self.node.get('label', '?')}」の記録時の全体スクリーンショットです。"
+            "黄色い枠が現在の判定範囲、赤色が枠の中で「判定から除外されている」"
+            "範囲です。ドラッグで新しく範囲を選び直せます(元の枠の外側は1枚の"
+            "静止画像しかないため、安定性は未検証のまま全面有効になります)。"
+            "タップしたい位置が範囲の中心と違う場合は、1点クリックして"
+            "個別に指定してください(緑の十字で表示されます)。"))
+
+        self.preview = ClickableLabel()
+        self.preview.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self.preview.dragged.connect(self.on_drag)
+        self.preview.clicked.connect(self.on_click_tap_pos)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(self.preview)
+        scroll.setWidgetResizable(False)
+        v.addWidget(scroll, 1)
+
+        self.lbl_ratio = QtWidgets.QLabel()
+        v.addWidget(self.lbl_ratio)
+
+        tap_row = QtWidgets.QHBoxLayout()
+        b_reset_tap = QtWidgets.QPushButton("タップ位置を範囲の中心に戻す")
+        b_reset_tap.clicked.connect(self.on_reset_tap)
+        tap_row.addWidget(b_reset_tap)
+        v.addLayout(tap_row)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(help_label(
+            "しきい値",
+            "この場では新しい撮影はしないため自動では再計算しません。"
+            "必要なら手動で調整してください(既存の値のままでも構いません)。"))
+        self.sp_threshold = QtWidgets.QDoubleSpinBox()
+        self.sp_threshold.setRange(0.0, 1.0)
+        self.sp_threshold.setSingleStep(0.01)
+        self.sp_threshold.setDecimals(3)
+        self.sp_threshold.setValue(float(self.node.get("threshold", 0.85)))
+        row.addWidget(self.sp_threshold)
+        v.addLayout(row)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        b_reset = QtWidgets.QPushButton("元に戻す")
+        b_reset.clicked.connect(self.on_reset)
+        btn_row.addWidget(b_reset)
+        b_save = QtWidgets.QPushButton("保存")
+        b_save.clicked.connect(self.save)
+        btn_row.addWidget(b_save)
+        b_close = QtWidgets.QPushButton("閉じる")
+        b_close.clicked.connect(self.close)
+        btn_row.addWidget(b_close)
+        v.addLayout(btn_row)
+
+        self.resize(min(1000, int(fw * self.preview_scale) + 60), 700)
+        self._render()
+
+    def _render(self):
+        h, w = self.full_tpl.shape
+        bgr = cv2.cvtColor(self.full_tpl, cv2.COLOR_GRAY2BGR)
+        # 判定に使う(有効な)範囲は元の画像のまま見せる(全域が有効な初期状態で
+        # 画像全体が色に埋もれてしまうと、どこを切り取ればいいか分からなく
+        # なるため)。除外された範囲だけ赤く着色して分かるようにする
+        blended = bgr.copy()
+        excluded = self.mask == 0
+        if excluded.any():
+            red_overlay = np.zeros_like(bgr)
+            red_overlay[:, :] = (0, 0, 255)
+            tinted = cv2.addWeighted(bgr, 0.45, red_overlay, 0.55, 0)
+            blended[excluded] = tinted[excluded]
+        x1, y1, x2, y2 = self.active_rect
+        cv2.rectangle(blended, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        if self.tap_pos is not None:
+            cv2.drawMarker(blended, self.tap_pos, (0, 255, 0), cv2.MARKER_CROSS, 24, 2)
+        scale = self.preview_scale
+        interp = cv2.INTER_NEAREST if scale >= 1 else cv2.INTER_AREA
+        big = cv2.resize(blended, (max(1, int(w * scale)), max(1, int(h * scale))),
+                          interpolation=interp)
+        big = np.ascontiguousarray(big)
+        qimg = QtGui.QImage(big.data, big.shape[1], big.shape[0],
+                             big.strides[0], QtGui.QImage.Format_BGR888)
+        self.preview.setPixmap(QtGui.QPixmap.fromImage(qimg.copy()))
+        self.preview.resize(big.shape[1], big.shape[0])
+        x1, y1, x2, y2 = self.active_rect
+        sub_mask = self.mask[y1:y2, x1:x2]
+        ratio = float((sub_mask > 0).mean()) if sub_mask.size else 0.0
+        tap = self.tap_pos or ((x1 + x2) // 2, (y1 + y2) // 2)
+        tap_note = "" if self.tap_pos is not None else "(範囲の中心)"
+        self.lbl_ratio.setText(
+            f"現在の判定範囲: {x2 - x1}×{y2 - y1}px / 有効画素率: {ratio * 100:.1f}% / "
+            f"タップ位置: {tap[0]},{tap[1]} {tap_note}")
+
+    def on_drag(self, dx1, dy1, dx2, dy2):
+        scale = self.preview_scale
+        x1, y1, x2, y2 = (int(v / scale) for v in (dx1, dy1, dx2, dy2))
+        h, w = self.mask.shape
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            return  # 小さすぎる選択は誤操作とみなして無視する
+        new_mask = np.zeros_like(self.mask)
+        new_mask[y1:y2, x1:x2] = self.mask[y1:y2, x1:x2]
+        self.mask = new_mask
+        self.active_rect = (x1, y1, x2, y2)
+        self._dirty = True
+        self._render()
+
+    def on_click_tap_pos(self, dx, dy):
+        scale = self.preview_scale
+        h, w = self.full_tpl.shape
+        x = max(0, min(int(dx / scale), w - 1))
+        y = max(0, min(int(dy / scale), h - 1))
+        self.tap_pos = (x, y)
+        self._dirty = True
+        self._render()
+
+    def on_reset_tap(self):
+        self.tap_pos = None
+        self._dirty = True
+        self._render()
+
+    def on_reset(self):
+        self.mask = self._orig_mask.copy()
+        self.active_rect = self._orig_active_rect
+        self.tap_pos = self._orig_tap_pos
+        self._dirty = True
+        self._render()
+
+    def save(self):
+        x1, y1, x2, y2 = self.active_rect
+        sub_mask = self.mask[y1:y2, x1:x2]
+        if not (sub_mask > 0).any():
+            QtWidgets.QMessageBox.warning(
+                self, "保存できません", "有効な範囲が0になっています。範囲を選び直してください。")
+            return
+        sub_tpl = self.full_tpl[y1:y2, x1:x2]
+        mask_name = self.node.get("mask")
+        if not mask_name:
+            mask_name = pathlib.Path(self.node["template"]).stem + "_mask.png"
+        core.imwrite(self.recipe_dir / self.node["template"], sub_tpl)
+        core.imwrite(self.recipe_dir / mask_name, sub_mask)
+        self.node["mask"] = mask_name
+        self.node["method"] = "masked_zncc"
+        self.node["threshold"] = self.sp_threshold.value()
+        # タップ位置を独立して指定していない場合は、従来通り範囲の中心を
+        # タップ位置として使う。指定している場合は、範囲の中心からの
+        # ずれ(dx/dy)として保存し、再生時は検出位置+dx/dyでタップする
+        center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+        tap_x, tap_y = self.tap_pos or (center_x, center_y)
+        self.node["x"] = tap_x
+        self.node["y"] = tap_y
+        self.node["dx"] = tap_x - center_x
+        self.node["dy"] = tap_y - center_y
+        core.save_recipe(self.name, self.full_data)
+        self._dirty = False
+        QtWidgets.QMessageBox.information(self, "保存しました", "マスクを更新しました。")
+
+    def closeEvent(self, event):
+        if self._dirty:
+            resp = QtWidgets.QMessageBox.question(
+                self, "保存されていない変更があります",
+                "保存せずに閉じますか？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if resp != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
+        event.accept()
+
+
+# ============================================ 画像1枚からの範囲選択(共通部品)
+class ScreenCropDialog(QtWidgets.QDialog):
+    """画像1枚(失敗履歴のスクリーンショット、既存ステップのcontextなど)を
+    表示し、ドラッグで選んだ範囲(検出に使う画像)と、クリックで指定した
+    タップ位置を切り出して返す共通部品。
+
+    検出範囲とタップ位置は別々に指定できる(例: 「フレンド申請しました」の
+    文字を検出範囲にしつつ、実際にタップしたいのは少し離れた場所にある
+    「閉じる」ボタン、というケース)。クリックしなければ検出範囲の中心を
+    タップ位置として使う。
+
+    ファイルの読み書きは一切行わない(結果を使って何をするかは呼び出し側
+    次第: 新規ステップとして保存する、条件として使う、など)。単一フレーム
+    の画像しか無いため、マスクは常に全域有効(旧ccoeff相当)で返す"""
+
+    TARGET_DISPLAY_HEIGHT = 900
+
+    def __init__(self, image_path, title="範囲を選択", message=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        bgr = core.imread(image_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"画像が読み込めません: {image_path}")
+        self.full_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        self.rect = None
+        self.tap_pos = None  # (x, y) 未指定ならacceptで検出範囲の中心を使う
+        self.result_data = None  # accept()成功後に (tpl_gray, mask, cx, cy) をセット
+
+        fh, fw = self.full_gray.shape
+        self.preview_scale = max(0.2, min(3.0, self.TARGET_DISPLAY_HEIGHT / fh))
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            message or
+            "検出に使う範囲をドラッグで選んでください。この画像は1枚の"
+            "静止画なので、選んだ範囲の判定は全域有効(旧ccoeff相当)になります"
+            "(赤・緑・黄色のマーカーが写っている場合は、かからない範囲を"
+            "選んでください)。タップしたい位置が範囲の中心と違う場合は、"
+            "1点クリックして個別に指定してください(緑の十字で表示されます)。"))
+
+        self.preview = ClickableLabel()
+        self.preview.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self.preview.dragged.connect(self.on_drag)
+        self.preview.clicked.connect(self.on_click_tap_pos)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(self.preview)
+        scroll.setWidgetResizable(False)
+        v.addWidget(scroll, 1)
+
+        self.lbl_info = QtWidgets.QLabel("範囲を選んでください")
+        v.addWidget(self.lbl_info)
+
+        b_reset_tap = QtWidgets.QPushButton("タップ位置を範囲の中心に戻す")
+        b_reset_tap.clicked.connect(self.on_reset_tap)
+        v.addWidget(b_reset_tap)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        self.btn_ok = btns.button(QtWidgets.QDialogButtonBox.Ok)
+        self.btn_ok.setEnabled(False)
+        v.addWidget(btns)
+
+        self.resize(min(1000, int(fw * self.preview_scale) + 60), 700)
+        self._render()
+
+    def _render(self):
+        bgr = cv2.cvtColor(self.full_gray, cv2.COLOR_GRAY2BGR)
+        if self.rect is not None:
+            x1, y1, x2, y2 = self.rect
+            cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        if self.tap_pos is not None:
+            cv2.drawMarker(bgr, self.tap_pos, (0, 255, 0), cv2.MARKER_CROSS, 24, 2)
+        h, w = self.full_gray.shape
+        scale = self.preview_scale
+        interp = cv2.INTER_NEAREST if scale >= 1 else cv2.INTER_AREA
+        big = cv2.resize(bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
+                          interpolation=interp)
+        big = np.ascontiguousarray(big)
+        qimg = QtGui.QImage(big.data, big.shape[1], big.shape[0],
+                             big.strides[0], QtGui.QImage.Format_BGR888)
+        self.preview.setPixmap(QtGui.QPixmap.fromImage(qimg.copy()))
+        self.preview.resize(big.shape[1], big.shape[0])
+        self._update_info()
+
+    def _update_info(self):
+        if self.rect is None:
+            self.lbl_info.setText("範囲を選んでください")
+            return
+        x1, y1, x2, y2 = self.rect
+        tap = self.tap_pos or ((x1 + x2) // 2, (y1 + y2) // 2)
+        tap_note = "" if self.tap_pos is not None else "(範囲の中心)"
+        self.lbl_info.setText(
+            f"検出範囲: {x2 - x1}×{y2 - y1}px  /  タップ位置: {tap[0]},{tap[1]} {tap_note}")
+
+    def on_drag(self, dx1, dy1, dx2, dy2):
+        scale = self.preview_scale
+        x1, y1, x2, y2 = (int(v / scale) for v in (dx1, dy1, dx2, dy2))
+        h, w = self.full_gray.shape
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            return
+        self.rect = (x1, y1, x2, y2)
+        self.btn_ok.setEnabled(True)
+        self._render()
+
+    def on_click_tap_pos(self, dx, dy):
+        scale = self.preview_scale
+        h, w = self.full_gray.shape
+        x = max(0, min(int(dx / scale), w - 1))
+        y = max(0, min(int(dy / scale), h - 1))
+        self.tap_pos = (x, y)
+        self._render()
+
+    def on_reset_tap(self):
+        self.tap_pos = None
+        self._render()
+
+    def accept(self):
+        if self.rect is None:
+            QtWidgets.QMessageBox.warning(self, "未選択", "検出範囲を選んでください")
+            return
+        x1, y1, x2, y2 = self.rect
+        tpl = self.full_gray[y1:y2, x1:x2].copy()
+        mask = np.full(tpl.shape, 255, dtype=np.uint8)
+        center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+        tap_x, tap_y = self.tap_pos or (center_x, center_y)
+        # dx/dyは「検出した範囲の中心」から「実際にタップしたい位置」への
+        # ずれ(core.cropが端寄せ補正に使うのと同じ意味)。再生時はcx,cyの
+        # 位置(=マッチした範囲の中心)にこのずれを足してタップするため、
+        # タップ位置を範囲の中心と別に指定した場合はここで必ず反映させる
+        dx, dy = tap_x - center_x, tap_y - center_y
+        self.result_data = (tpl, mask, tap_x, tap_y, dx, dy)
+        super().accept()
+
+    @staticmethod
+    def pick(image_path, title="範囲を選択", message=None, parent=None):
+        """(tpl_gray, mask, tap_x, tap_y, dx, dy) を返す。キャンセル/失敗時はNone。
+        tap_x, tap_yはこの画像上での絶対位置(表示・参考用)、dx, dyは
+        「検出範囲の中心」から「タップ位置」へのずれで、recipe.jsonの
+        step["dx"]/step["dy"]にそのまま書ける値"""
+        dlg = ScreenCropDialog(image_path, title, message, parent)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        return dlg.result_data
+
+
 # ============================================================ 再生スレッド
 class PlayerThread(QtCore.QThread):
     sig_log = QtCore.Signal(str)
@@ -941,9 +2017,19 @@ class PlayerThread(QtCore.QThread):
     TAP_VERIFY_POLL_INTERVAL = 0.3
     TAP_VERIFY_POLL_MAX_MULTIPLIER = 2.0
 
+    # ステップ待ちがこの秒数を超えても対象が現れない場合、「各ステップ最大
+    # 待ち秒」(既定300秒)の失敗確定を待たず、一度だけ「進んでいません」と
+    # 早期に通知する(放置運用で5分間気づけないのは不便なため)。この後も
+    # 待機自体は続け、最終的に失敗すれば別途失敗通知が出る。
+    # 「各ステップ最大待ち秒」をこれ未満に設定した場合は、先にタイムアウトの
+    # 方が来るため、この通知は出ない(特別扱いは不要)
+    STALL_NOTIFY_SECONDS = 120
+
     def __init__(self, serial, name, loops, threshold_offset,
                  step_timeout, after, poll, jitter, max_fail,
-                 verify=True, tap_retry=3, hold_ms=0):
+                 verify=True, tap_retry=3, hold_ms=0,
+                 notify_fail=True, notify_done=True,
+                 notify_disconnect=True, notify_stall=True):
         super().__init__()
         self.serial = serial
         self.name = name
@@ -957,6 +2043,10 @@ class PlayerThread(QtCore.QThread):
         self.verify = verify
         self.tap_retry = max(1, tap_retry)
         self.hold_ms = hold_ms
+        self.notify_fail = notify_fail
+        self.notify_done = notify_done
+        self.notify_disconnect = notify_disconnect
+        self.notify_stall = notify_stall
         self._serial = serial
         self._stop = False
         self._log_file = None
@@ -973,9 +2063,11 @@ class PlayerThread(QtCore.QThread):
         # から設定される。タップ直前のスクショ空間→表示解像度変換に使う
         self.sw = None
         self.sh = None
-        # 今どの周回かを保持しておく(繰り返しポップアップの記録に、どの周
-        # だったかを残すため。run()の冒頭で最新の値に更新される)
+        # 通知用の状態。_current_cycleはその時点の周回数(通知本文に使う)。
+        # _disconnect_notifiedは「接続切れ」通知の連投を防ぐためのフラグで、
+        # 端末との通信が一度でも回復すれば(back操作が成功すれば)Falseに戻す
         self._current_cycle = 0
+        self._disconnect_notified = False
         # 共通ポップアップの繰り返し検知を周回ごとに数えるための状態。
         # どちらも{ポップアップのlabel: 回数}で、周回の頭(run())で
         # 空にリセットする(周回をまたいで引き継がない)
@@ -1148,7 +2240,14 @@ class PlayerThread(QtCore.QThread):
                 best_loc=(pmethod, pval, pcx, pcy),
                 recorded_pos=recorded_pos,
                 tapped_pos=(tapped_x, tapped_y))
-            safe_label = "".join(c if c.isalnum() else "_" for c in popup["label"])[:30]
+            # isalnum()だけだと日本語などの非ASCII文字も"英数字"として素通り
+            # してしまい、その結果ファイル名に日本語が残る(cv2.imread/imwriteが
+            # Windowsで日本語パスを静かに読み書き失敗する原因になる。core.imread/
+            # imwriteで読み書き自体は保護しているが、ファイル名自体もASCIIに
+            # 揃えておく方が他のツールとの互換性含めて安全なため、isascii()も
+            # あわせて確認する
+            safe_label = "".join(
+                c if (c.isalnum() and c.isascii()) else "_" for c in popup["label"])[:30]
             fname = (f"popup_repeat_{datetime.datetime.now():%H%M%S}_"
                      f"{safe_label}_{count}.png")
             core.imwrite(recipe_dir / fname, img)
@@ -1192,7 +2291,11 @@ class PlayerThread(QtCore.QThread):
         """
         import random
         step = cursor.current()
-        deadline = time.time() + self.step_timeout
+        # 分岐の中を実行しているときにログの階層が追えるよう、今いる
+        # ブロックの深さぶんインデントする(根がdepth=1で無インデント)
+        indent = "  " * (cursor.depth() - 1)
+        wait_start = time.time()
+        deadline = wait_start + self.step_timeout
         # best_by_method: {手法名: (これまでの最高一致度, その時のしきい値)}。
         # 試した手法すべての最高値を残しておき、タイムアウト/失敗時の
         # ヒント表示とfailures.jsonlへの記録(【実装3】)に使う
@@ -1201,6 +2304,10 @@ class PlayerThread(QtCore.QThread):
         self._last_best_loc = None
         self._last_tapped_pos = None
         last_report = time.time()
+        # このステップ待ちの間に「進んでいません」通知を出したかどうか。
+        # ローカル変数なので呼び出し(=ステップ)ごとに必ずFalseへ戻り、
+        # 同一ステップで2回以上通知することはない
+        stall_notified = False
         while time.time() < deadline:
             if self._stop:
                 raise KeyboardInterrupt
@@ -1237,7 +2344,7 @@ class PlayerThread(QtCore.QThread):
                     core.tap(self._serial, tx, ty, self.hold_ms)
                     tag = f" [{attempt}回目]" if attempt > 1 else ""
                     self._log(
-                        f"    {step['label']}: タップ({tx},{ty}) "
+                        f"{indent}    {step['label']}: タップ({tx},{ty}) "
                         f"一致{val:.4f}[{method_used}]{fallback_note}{tag}")
 
                     if not self.verify:
@@ -1285,20 +2392,20 @@ class PlayerThread(QtCore.QThread):
 
                     elapsed = time.time() - verify_start
                     if gone:
-                        self._log(f"    …消失確認: {elapsed:.1f}秒で消えました")
+                        self._log(f"{indent}    …消失確認: {elapsed:.1f}秒で消えました")
                         cursor.advance()
                         return False  # ボタンが消えた＝タップ成功、次へ
 
                     # まだ同じボタンが見えている＝タップが効いていない → 押し直す
                     fallback_note = "(エッジ判定で検出)" if method_used == "edge" else ""
                     self._log(
-                        f"    …{elapsed:.1f}秒間ボタンが残っています"
+                        f"{indent}    …{elapsed:.1f}秒間ボタンが残っています"
                         f"(一致{nval:.4f}[{nmethod}])。押し直します")
                 self._last_attempts = self._attempts_summary(best_by_method)
                 if popup_interrupted:
                     continue  # ポップアップを閉じたので対象を探し直す
                 self._log(
-                    f"    !! {step['label']}: 押しても反応しません。"
+                    f"{indent}    !! {step['label']}: 押しても反応しません。"
                     "「タップ長押しms」を80〜150に上げてみてください")
                 raise RuntimeError(
                     f"{step['label']}: {self.tap_retry}回タップしても次の画面に"
@@ -1318,19 +2425,18 @@ class PlayerThread(QtCore.QThread):
                         # 厳しくしている。それに届かなければスキップしない
                         other = None
                 if other is not None:
-                    # ログ表示用の1based番号。root_index()はフェーズ0時点
-                    # (ネスト無し)でのみ「レシピの何番目か」と一致する
-                    # (Cursor.root_index()のdocstring参照)
-                    current_display = cursor.root_index() + 1
-                    target_display = current_display + local_idx + 1
                     jx = ocx + other_step.get("dx", 0) + random.randint(-self.jitter, self.jitter)
                     jy = ocy + other_step.get("dy", 0) + random.randint(-self.jitter, self.jitter)
                     tx, ty = self._to_window(jx, jy, gray.shape)
                     core.tap(self._serial, tx, ty, self.hold_ms)
                     fallback_note = "(エッジ判定で検出)" if omethod == "edge" else ""
+                    # 番号ではなくラベルだけで表示する(ネストが入ると
+                    # 「全体の何番目か」という単一の番号は意味を持たない。
+                    # siblings_ahead()により候補は常に今のブロック内の
+                    # 兄弟に限られるので、else側や親ブロックへ飛ぶことはない)
                     self._log(
-                        f"    !! ステップ{current_display}「{step['label']}」をスキップして"
-                        f"ステップ{target_display}「{other_step['label']}」へ進みました"
+                        f"{indent}    !! 「{step['label']}」をスキップして"
+                        f"「{other_step['label']}」へ進みました"
                         f"(この先の画像を検知・一致{oval:.4f}[{omethod}]){fallback_note}")
                     time.sleep(self.after)
                     # 元の対象を待ち続けても二度と現れないので、進んだ先(=見つけた
@@ -1339,12 +2445,26 @@ class PlayerThread(QtCore.QThread):
                     cursor.advance_to_sibling(local_idx + 2)
                     return True
 
+            # まだ見つからない状態がSTALL_NOTIFY_SECONDS続いたら、「各ステップ
+            # 最大待ち秒」での失敗確定(最大で300秒等)を待たず、一度だけ早期に
+            # 知らせる。stall_notifiedはこの呼び出し(=このステップ)専用の
+            # ローカル変数なので、同一ステップで2回以上は通知しない
+            if (self.notify_stall and not stall_notified
+                    and time.time() - wait_start >= self.STALL_NOTIFY_SECONDS):
+                stall_notified = True
+                notify.notify_async(
+                    "TapReplay: 進捗が止まっています",
+                    f"レシピ「{self.name}」周回{self._current_cycle}\n"
+                    f"ステップ「{step['label']}」が"
+                    f"{self.STALL_NOTIFY_SECONDS}秒進んでいません",
+                    on_error=self._log)
+
             # まだ見つからない → 数秒おきに現在の一致度を報告
             if time.time() - last_report >= 3:
                 last_report = time.time()
                 detail = " / ".join(
                     f"{m}:{v:.4f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
-                self._log(f"    待機中… {step['label']} 最高一致度 {detail}")
+                self._log(f"{indent}    待機中… {step['label']} 最高一致度 {detail}")
             time.sleep(self.poll)
 
         # タイムアウト → 最高一致度から原因を推定してヒントを出す
@@ -1359,6 +2479,47 @@ class PlayerThread(QtCore.QThread):
         detail = " / ".join(
             f"{m}:{v:.4f}(しきい値{t:.2f})" for m, (v, t) in best_by_method.items())
         raise TimeoutError(f"{step['label']} が出現せず ({detail}) {hint}")
+
+    def _evaluate_condition(self, d, condition, indent):
+        """ifノードのconditionを1回だけ判定する(_wait_and_tapのような
+        ポーリング待ちはしない。その場のスクリーンショット1枚で判定する)。
+
+        既存のcore.peak_match()をそのまま使う。しきい値を跨いだかどうか
+        (found)を、condition["kind"]がimage_foundならそのまま、
+        image_not_foundなら反転してthen/elseどちらを選ぶかを決める。
+        戻り値: thenを選ぶか(bool)"""
+        gray = core.to_gray(d.screenshot())
+        method = condition.get("method", "ccoeff")
+        mask = condition.get("_mask") if method == "masked_zncc" else None
+        threshold = condition.get("threshold", 0.85)
+        cx, cy, val = core.peak_match(gray, condition["_gray"], method=method, mask=mask)
+        found = cx is not None and val >= threshold
+        kind = condition["kind"]
+        if kind == "image_found":
+            take_then = found
+        elif kind == "image_not_found":
+            take_then = not found
+        else:
+            raise ValueError(f"未知のcondition kindです: {kind!r}")
+        return take_then, val, threshold, method
+
+    def _run_if_node(self, d, cursor, node):
+        """ifノードを1つ処理する: conditionを判定し、選んだ枝(then/else)へ
+        cursorを進める(enter_block)。ブロックの退出はcursor.current()側の
+        自動popに任せ、run()のループがそれを検知してログに残す(この
+        関数では入場だけを担当する)"""
+        indent = "  " * (cursor.depth() - 1)
+        label = node.get("label", "?")
+        take_then, val, threshold, method = self._evaluate_condition(
+            d, node["condition"], indent)
+        branch = "then" if take_then else "else"
+        self._log(
+            f"{indent}条件判定: 「{label}」 → "
+            f"一致{val:.4f}[{method}](しきい値{threshold:.2f}) → {branch} へ")
+        branch_nodes = node.get(branch) or []
+        self._log(f"{indent}→ 「{label}」の{branch}へ入ります({len(branch_nodes)}ノード)")
+        self._block_label_stack.append((label, branch))
+        cursor.enter_block(branch_nodes)
 
     def run(self):
         recipe_dir = core.recipe_dir(self.name)
@@ -1432,10 +2593,15 @@ class PlayerThread(QtCore.QThread):
                         "あり、タップ位置が信用できません")
 
             popups = data.get("popups", [])
+            # data["steps"]は木構造なので、旧形式検出・ステップ数表示などの
+            # 診断目的では、ネストを問わずtapノードだけを平らにした一覧を使う
+            # (if自体は"threshold"を持たないので、data["steps"]をそのまま
+            # 見るとif混じりのレシピを誤って「旧形式」と判定してしまう)
+            tap_nodes = list(core.iter_tap_leaves(data["steps"]))
             # ステップごとのしきい値("threshold"キー)を持たない旧形式のレシピが
             # 1件でもあれば、GUIの調整欄の値域・初期値が変わっていることに
             # よるユーザーの混乱を避けるため、その旨を1行ログに出しておく
-            if any("threshold" not in s for s in data["steps"] + popups):
+            if any("threshold" not in s for s in tap_nodes + popups):
                 self._log(
                     "!! 注意: ステップごとのしきい値を持たない旧形式のレシピです。"
                     f"「一致しきい値の調整（全体）」欄の値({self.threshold_offset:.2f})"
@@ -1446,7 +2612,7 @@ class PlayerThread(QtCore.QThread):
             # 不正な値である可能性が高い。もう再現はしないが、既にそうした
             # 値で記録されてしまった既存レシピを検出して知らせる
             broken_labels = [
-                s.get("label", "?") for s in data["steps"] + popups
+                s.get("label", "?") for s in tap_nodes + popups
                 if s.get("threshold") is not None and s["threshold"] > 1.0
             ]
             if broken_labels:
@@ -1454,11 +2620,12 @@ class PlayerThread(QtCore.QThread):
                     "!! 注意: 以下のステップは不正なしきい値(1.0超)で記録されて"
                     "います(過去の数値不具合が原因の可能性)。正しく検出できない"
                     f"ため撮り直しをおすすめします: {', '.join(broken_labels)}")
-            self._log(f"再生開始: {len(data['steps'])}ステップ"
+            self._log(f"再生開始: {len(tap_nodes)}ステップ"
                       f"（共通ポップアップ{len(popups)}件） / "
                       f"{'無限' if self.loops == 0 else self.loops}周")
 
             ok = ng_total = ng_streak = cycle = incomplete = 0
+            stopped_by_failure = False
             started = time.time()
             while self.loops == 0 or cycle < self.loops:
                 if self._stop:
@@ -1469,6 +2636,9 @@ class PlayerThread(QtCore.QThread):
                 # 引き継がない(周回ごとに0から数え直す)
                 self._popup_repeat_counts = {}
                 self._popup_repeat_saved = {}
+                # 実行トレースのログ用: 今どのifの、どちらの枝に入っているかの
+                # スタック(要素は(ifのlabel, "then"/"else"))。周回ごとに空へ
+                self._block_label_stack = []
                 self._log(f"=== ループ {cycle} ===")
                 current_step = None
                 try:
@@ -1481,10 +2651,27 @@ class PlayerThread(QtCore.QThread):
                     skipped_this_cycle = False
                     while True:
                         current_step = cursor.current()
+                        # current()の中でブロックを1つ以上抜けていたら
+                        # (自動でスタックが縮んでいたら)、実行トレースの
+                        # ログにその分を残す。ブロックの深さ(depth-1)より
+                        # ラベルスタックが深い分だけ、実際に抜けたとみなす
+                        while len(self._block_label_stack) > max(cursor.depth() - 1, 0):
+                            label, branch = self._block_label_stack.pop()
+                            exit_indent = "  " * len(self._block_label_stack)
+                            self._log(f"{exit_indent}← 「{label}」の{branch}を抜けました")
                         if current_step is None:
                             break
-                        skipped = self._wait_and_tap(d, cursor, popups)
-                        skipped_this_cycle = skipped_this_cycle or skipped
+                        ntype = current_step.get("type", "tap")
+                        if ntype == "tap":
+                            skipped = self._wait_and_tap(d, cursor, popups)
+                            skipped_this_cycle = skipped_this_cycle or skipped
+                        elif ntype == "if":
+                            self._run_if_node(d, cursor, current_step)
+                        elif ntype == "loop":
+                            raise NotImplementedError(
+                                "type='loop' の実行制御はフェーズ2以降で対応します")
+                        else:
+                            raise ValueError(f"未知のノードtypeです: {ntype!r}")
                     avg = (time.time() - started) / cycle
                     if skipped_this_cycle:
                         # スキップで途中のステップを飛ばした周は、実際には
@@ -1511,8 +2698,10 @@ class PlayerThread(QtCore.QThread):
                     self._log(f"!! ループ {cycle} 失敗: {e}")
                     # 参考情報: マスクの有効画素率と記録時に算出したしきい値。
                     # マスクがほとんど残っていないステップは、そもそも画像認識に
-                    # 向いていないことが多いため、原因の見当をつけやすくする
-                    if current_step is not None:
+                    # 向いていないことが多いため、原因の見当をつけやすくする。
+                    # ifノードは"_mask"/"threshold"を(あればcondition側に)
+                    # 持たないため対象外(current_stepがtapのときだけ意味がある)
+                    if current_step is not None and current_step.get("type", "tap") == "tap":
                         mask_arr = current_step.get("_mask")
                         if mask_arr is not None:
                             valid_ratio = float((mask_arr > 0).mean())
@@ -1522,16 +2711,23 @@ class PlayerThread(QtCore.QThread):
                             self._log(f"    参考: 記録時に算出したしきい値 {ref_thr:.4f}")
                     # 失敗の記録自体が失敗しても(端末との接続切れ等)再生は止めない
                     try:
+                        # isalnum()だけでは日本語などの非ASCII文字が素通りして
+                        # しまう(str(e)はステップ名を含むことが多く日本語になり
+                        # がち)。ファイル名はASCIIに揃えておく(core.imread/imwrite
+                        # 自体はcv2のWindows日本語パス問題を回避済みだが、
+                        # 他のツールとの互換性も考えて名前の方も揃えておく)
                         safe_reason = "".join(
-                            c if c.isalnum() else "_" for c in str(e))[:40]
+                            c if (c.isalnum() and c.isascii()) else "_" for c in str(e))[:40]
                         fname = f"error_{datetime.datetime.now():%H%M%S}_{safe_reason}.png"
                         img = core.to_bgr(d.screenshot())
-                        if current_step is not None:
+                        if current_step is not None and current_step.get("type", "tap") == "tap":
                             # 失敗時のスクショに、最も一致した位置(赤)・記録上の
                             # タップ位置(緑)・実際にタップした位置(黄)を描き込む。
                             # 「正しい場所にマッチしているのにタップが効かない」のか
                             # 「そもそも無関係な場所にマッチしている」のかを一目で
-                            # 切り分けられるようにするため
+                            # 切り分けられるようにするため。ifノードの失敗(条件
+                            # 判定自体の例外等)はこの位置描画の対象外(current_step
+                            # 自体に"_gray"/"x"/"y"を持たないため)
                             recorded_pos = None
                             if (current_step.get("x") is not None
                                     and current_step.get("y") is not None):
@@ -1549,18 +2745,43 @@ class PlayerThread(QtCore.QThread):
                         self._log(f"!! 失敗時のスクリーンショット保存に失敗: {e2}")
                     if ng_streak >= self.max_fail:
                         self._log(f"!! 失敗が{ng_streak}回連続したため停止します")
+                        stopped_by_failure = True
+                        if self.notify_fail:
+                            fail_step_label = current_step["label"] if current_step else "?"
+                            notify.notify_async(
+                                "TapReplay: 失敗のため停止しました",
+                                f"レシピ「{self.name}」周回{cycle}\n"
+                                f"ステップ「{fail_step_label}」が{ng_streak}回連続失敗\n{e}",
+                                on_error=self._log)
                         break
                     # back操作自体が失敗しても(接続切れ等)スレッドを落とさず次周へ進む
                     try:
                         d.press("back")
+                        # 通信が回復したので、次に切れたときまた通知できるようにする
+                        self._disconnect_notified = False
                     except Exception as e2:
                         self._log(f"!! 端末との通信に失敗しました(接続切れの可能性): {e2}")
+                        if self.notify_disconnect and not self._disconnect_notified:
+                            self._disconnect_notified = True
+                            notify.notify_async(
+                                "TapReplay: 端末との接続が切れました",
+                                f"レシピ「{self.name}」周回{cycle}\n{e2}",
+                                on_error=self._log)
                     time.sleep(3)
                 time.sleep(1)
 
             total = (time.time() - started) / 60
             self._log(
                 f"終了: 成功{ok} / 失敗{ng_total} / 不完全{incomplete} / {total:.1f}分")
+            # 指定回数の周回が完了した場合のみ通知する(0=無限ループ指定時、
+            # 手動停止、失敗による停止は対象外)
+            if (self.notify_done and self.loops != 0
+                    and not self._stop and not stopped_by_failure):
+                notify.notify_async(
+                    "TapReplay: 周回が完了しました",
+                    f"レシピ「{self.name}」{cycle}周 完了\n"
+                    f"成功{ok} / 失敗{ng_total} / 不完全{incomplete} / {total:.1f}分",
+                    on_error=self._log)
         except Exception as e:
             self._log(f"!! 再生エラー: {e}")
         finally:
@@ -1580,6 +2801,10 @@ class MainWindow(QtWidgets.QWidget):
         self.resize(560, 700)
         self.serial = None
         self.worker = None
+        # 設定(通知のON/OFFなど)は、recipesと同様exeのある場所を基準にした
+        # settings.iniに保存する(exeフォルダごと配布・移動しても一緒に付いてくる)
+        self.settings = QtCore.QSettings(
+            str(core.SETTINGS_PATH), QtCore.QSettings.IniFormat)
 
         v = QtWidgets.QVBoxLayout(self)
 
@@ -1623,7 +2848,10 @@ class MainWindow(QtWidgets.QWidget):
             "切抜き幅",
             "クリックした位置を中心に、ボタン画像を切り抜く横幅(ピクセル)です。"
             "大きくすると周囲の文字ごと含められ、似たボタンと区別しやすくなります。"
-            "小さすぎるとほぼ無地の画像になり、暗転画面などへの誤検知の原因になります。"), 0, 0)
+            "小さすぎるとほぼ無地の画像になり、暗転画面などへの誤検知の原因になります。"
+            "記録画面でクリックの代わりにドラッグすると、この値を使わずドラッグした"
+            "矩形の範囲がそのまま切り抜かれます(アニメーションのある画面で、"
+            "動かない部分だけを自分で選びたいときに使ってください)。"), 0, 0)
         g.addWidget(self.sp_w, 0, 1)
         g.addWidget(help_label("高さ", "切り抜く縦幅(ピクセル)です。考え方は「切抜き幅」と同じです。"), 0, 2)
         g.addWidget(self.sp_h, 0, 3)
@@ -1633,6 +2861,13 @@ class MainWindow(QtWidgets.QWidget):
             self.btn_rec,
             "上のレシピ名で記録ウィンドウを開きます。既に記録済みのレシピ名を"
             "指定した場合は、続きから追加記録するか選べます。"), 1, 0, 1, 4)
+        self.btn_edit_structure = QtWidgets.QPushButton("分岐を編集")
+        self.btn_edit_structure.clicked.connect(self.on_edit_structure)
+        g.addWidget(with_help(
+            self.btn_edit_structure,
+            "上のレシピ名で記録済みのレシピを開き、if/elseの分岐構造を編集"
+            "します。端末には接続しません(記録済みの画像を使って画面上で"
+            "組み立てるだけです)。"), 2, 0, 1, 4)
         tv.addLayout(groupbox_help(
             "端末の画面をPC上でクリックして、操作手順(レシピ)を記録します。"))
         tv.addWidget(box)
@@ -1716,6 +2951,41 @@ class MainWindow(QtWidgets.QWidget):
             self.btn_play, "上で選んだレシピを、この設定で再生します。"), 5, 0, 1, 4)
         pv.addLayout(groupbox_help("記録したレシピを自動で繰り返し実行します。"))
         pv.addWidget(box)
+
+        box = QtWidgets.QGroupBox("通知(放置実行中の状況をWindowsのトースト通知でお知らせ)")
+        ng = QtWidgets.QGridLayout(box)
+        self.ck_notify_fail = QtWidgets.QCheckBox("失敗して停止したときに通知")
+        self.ck_notify_fail.setChecked(True)
+        self.ck_notify_done = QtWidgets.QCheckBox("指定回数の周回が完了したときに通知")
+        self.ck_notify_done.setChecked(True)
+        self.ck_notify_disconnect = QtWidgets.QCheckBox("端末との接続が切れたときに通知")
+        self.ck_notify_disconnect.setChecked(True)
+        self.ck_notify_stall = QtWidgets.QCheckBox("進捗が長時間止まっているときに通知")
+        self.ck_notify_stall.setChecked(True)
+        ng.addWidget(with_help(
+            self.ck_notify_fail,
+            "「連続失敗で停止」の回数だけ連続で失敗して再生そのものが"
+            "停止したときに通知します。"), 0, 0)
+        ng.addWidget(with_help(
+            self.ck_notify_done,
+            "「実行回数」で指定した周回をすべて終えたときに通知します。"
+            "「実行回数」が0(無限ループ)の場合は対象外です(終わりが無いため)。"), 0, 1)
+        ng.addWidget(with_help(
+            self.ck_notify_disconnect,
+            "再生中にUSB切断などで端末と通信できなくなったときに通知します。"
+            "通信が回復すれば、次に切れたときまた通知します。"), 1, 0)
+        ng.addWidget(with_help(
+            self.ck_notify_stall,
+            f"1つのステップの画像が{PlayerThread.STALL_NOTIFY_SECONDS}秒経っても"
+            "現れないとき、「各ステップ最大待ち秒」での失敗確定を待たず、"
+            "一度だけ「進んでいません」と早めに通知します。その後も待機自体は"
+            "続き、最終的に失敗すれば別途「失敗して停止」の通知が出ます"
+            "(同じステップで2回以上通知することはありません)。"), 1, 1)
+        for cb in (self.ck_notify_fail, self.ck_notify_done,
+                   self.ck_notify_disconnect, self.ck_notify_stall):
+            cb.toggled.connect(self._save_notify_settings)
+        pv.addWidget(box)
+
         pv.addStretch(1)
         tabs.addTab(tab_play, "再生")
 
@@ -1744,6 +3014,15 @@ class MainWindow(QtWidgets.QWidget):
         cv.addLayout(groupbox_help(
             "このレシピで記録済みの操作ステップの一覧です。上から順番に実行されます。"))
         bl.addWidget(self.list_steps)
+        b_adjust_step = QtWidgets.QPushButton("選択したステップのマスクを調整")
+        b_adjust_step.clicked.connect(
+            lambda: self.on_adjust_mask("steps", self.list_steps))
+        bl.addWidget(with_help(
+            b_adjust_step,
+            "端末に接続し直さず、保存済みの画像のまま判定範囲(マスク)を"
+            "絞り込みます。アニメーションなどで判定が安定しないとき、"
+            "動いていなさそうな部分だけを自分でドラッグ選択できます"
+            "(絞り込むことだけができ、広げることはできません)。"))
         cv.addWidget(box, 1)
 
         box = QtWidgets.QGroupBox("共通ポップアップ（順序を問わず割り込みを閉じる）")
@@ -1755,6 +3034,19 @@ class MainWindow(QtWidgets.QWidget):
             "可能性がある画面を登録する場所です。再生中はステップの実行順序に"
             "関係なく、これらの画像が見えたら優先して閉じてから元の操作を続けます。"))
         bl.addWidget(self.list_popups)
+        b_adjust_popup = QtWidgets.QPushButton("選択した共通ポップアップのマスクを調整")
+        b_adjust_popup.clicked.connect(
+            lambda: self.on_adjust_mask("popups", self.list_popups))
+        bl.addWidget(with_help(
+            b_adjust_popup,
+            "ステップと同様、端末に接続し直さず判定範囲(マスク)を絞り込みます。"))
+        b_delete_popup = QtWidgets.QPushButton("選択した共通ポップアップを削除")
+        b_delete_popup.setStyleSheet("color: #b00000;")
+        b_delete_popup.clicked.connect(self.on_delete_popup)
+        bl.addWidget(with_help(
+            b_delete_popup,
+            "選んだ共通ポップアップをレシピから削除します。元に戻せません。"
+            "テンプレート画像などのファイル自体は残ります。"))
         cv.addWidget(box, 1)
 
         tabs.addTab(tab_content, "記録内容")
@@ -1816,7 +3108,20 @@ class MainWindow(QtWidgets.QWidget):
             "その時の端末画面のスクリーンショットを右側に表示します。"))
         fv.addWidget(box, 1)
 
+        b_new_from_failure = QtWidgets.QPushButton("この画像から新しいステップを作る")
+        b_new_from_failure.clicked.connect(self.on_new_step_from_failure)
+        fv.addWidget(with_help(
+            b_new_from_failure,
+            "選択した失敗履歴のスクリーンショットを元に、端末に接続し直さず"
+            "新しいステップ(または共通ポップアップ)を作ります。狙った場所を"
+            "ドラッグで選んでください。画像に赤・緑・黄色のマーカーが"
+            "描き込まれている場合があるので、マーカーにかからない範囲を"
+            "選んでください。単一の静止画からの作成のため、判定範囲は"
+            "全域有効(旧ccoeff相当)になります。"))
+
         tabs.addTab(tab_fail, "失敗履歴")
+
+        self._load_notify_settings()
 
         self.tabs = tabs
         tabs.currentChanged.connect(self.on_tab_changed)
@@ -1879,6 +3184,26 @@ class MainWindow(QtWidgets.QWidget):
                     "終了処理を続行します")
         event.accept()
 
+    def _load_notify_settings(self):
+        """通知ON/OFFの設定を読み込む(既定はすべてON)"""
+        for cb, key in (
+            (self.ck_notify_fail, "notify/fail"),
+            (self.ck_notify_done, "notify/done"),
+            (self.ck_notify_disconnect, "notify/disconnect"),
+            (self.ck_notify_stall, "notify/stall"),
+        ):
+            cb.blockSignals(True)
+            cb.setChecked(self.settings.value(key, True, type=bool))
+            cb.blockSignals(False)
+
+    def _save_notify_settings(self):
+        """通知ON/OFFのチェックボックスが変更されるたびに、そのまま保存する
+        (「保存」操作を挟まなくても次回起動時に引き継がれるように)"""
+        self.settings.setValue("notify/fail", self.ck_notify_fail.isChecked())
+        self.settings.setValue("notify/done", self.ck_notify_done.isChecked())
+        self.settings.setValue("notify/disconnect", self.ck_notify_disconnect.isChecked())
+        self.settings.setValue("notify/stall", self.ck_notify_stall.isChecked())
+
     def on_connect(self):
         self.serial = self.ed_serial.text().strip() or None
         try:
@@ -1921,6 +3246,150 @@ class MainWindow(QtWidgets.QWidget):
         if self.cmb_recipe.findText(name) < 0:
             self.cmb_recipe.addItem(name)
 
+    def on_edit_structure(self):
+        name = self.cmb_recipe.currentText().strip()
+        if not name:
+            self.append("!! レシピ名を入れてください")
+            return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
+        if not (core.recipe_path(name) / "recipe.json").exists():
+            self.append(f"!! 「{name}」はまだ記録されていません。先に記録してください")
+            return
+        try:
+            dlg = StructureEditorDialog(name, self)
+        except Exception as e:
+            self.append(f"!! 分岐編集画面の準備に失敗: {e}")
+            return
+        self.append(f"分岐編集画面を開きました（{name}）")
+        dlg.exec()
+        self.append(f"分岐編集画面を閉じました（{name}）")
+        self.refresh_history()
+
+    def on_adjust_mask(self, kind, list_widget):
+        name = self.cmb_recipe.currentText().strip()
+        if not name:
+            self.append("!! レシピ名を入れてください")
+            return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
+        row = list_widget.currentRow()
+        if row < 0:
+            self.append("!! 調整する項目を一覧から選択してください")
+            return
+        try:
+            dlg = MaskEditorDialog(name, kind, row, self)
+        except Exception as e:
+            self.append(f"!! マスク調整画面の準備に失敗: {e}")
+            return
+        dlg.exec()
+        self.append(f"マスク調整画面を閉じました（{name}）")
+        self.refresh_history()
+
+    def on_delete_popup(self):
+        name = self.cmb_recipe.currentText().strip()
+        if not name:
+            self.append("!! レシピ名を入れてください")
+            return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
+        row = self.list_popups.currentRow()
+        if row < 0:
+            self.append("!! 削除する共通ポップアップを一覧から選択してください")
+            return
+        recipe_dir = core.recipe_path(name)
+        try:
+            data = json.loads((recipe_dir / "recipe.json").read_text(encoding="utf-8"))
+        except Exception as e:
+            self.append(f"!! レシピの読み込みに失敗: {e}")
+            return
+        popups = data.get("popups", [])
+        if not (0 <= row < len(popups)):
+            self.append("!! 選択が無効です(表示を更新してからやり直してください)")
+            return
+        label = popups[row].get("label", "?")
+        resp = QtWidgets.QMessageBox.question(
+            self, "削除の確認",
+            f"共通ポップアップ「{label}」を削除しますか？\n"
+            "元に戻せません(テンプレート画像などのファイル自体は残ります)。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        del popups[row]
+        core.save_recipe(name, data)
+        self.append(f"共通ポップアップ「{label}」を削除しました（{name}）")
+        self.refresh_history()
+
+    def on_new_step_from_failure(self):
+        name = self.cmb_recipe.currentText().strip()
+        if not name:
+            self.append("!! レシピ名を入れてください")
+            return
+        if not is_valid_recipe_name(name):
+            self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
+        item = self.list_failures.currentItem()
+        fname = item.data(QtCore.Qt.UserRole) if item is not None else None
+        if not fname:
+            self.append("!! 元にする失敗履歴の画像を一覧から選択してください")
+            return
+        recipe_dir = core.recipe_path(name)
+        image_path = recipe_dir / fname
+        if not image_path.exists():
+            self.append(f"!! 画像が見つかりません: {fname}")
+            return
+
+        try:
+            result = ScreenCropDialog.pick(
+                image_path, title=f"新しいステップを作成: {name}", parent=self)
+        except Exception as e:
+            self.append(f"!! 画像の読み込みに失敗: {e}")
+            return
+        if result is None:
+            return
+        tpl_gray, mask, cx, cy, dx, dy = result
+
+        label, ok = QtWidgets.QInputDialog.getText(self, "ステップの名前", "名前を入力してください:")
+        if not ok or not label.strip():
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self, "追加先",
+            "共通ポップアップとして追加しますか？\n"
+            "「はい」: 共通ポップアップ(順序を問わず割り込みを閉じる)\n"
+            "「いいえ」: 通常のステップ(手順の末尾に追加)",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        as_popup = resp == QtWidgets.QMessageBox.Yes
+
+        data = json.loads((recipe_dir / "recipe.json").read_text(encoding="utf-8"))
+        data.setdefault("steps", [])
+        data.setdefault("popups", [])
+        ts = datetime.datetime.now().strftime("%H%M%S")
+        prefix = "popup_from_failure" if as_popup else "step_from_failure"
+        tpl_name = f"{prefix}_{ts}.png"
+        mask_name = f"{prefix}_{ts}_mask.png"
+        core.imwrite(recipe_dir / tpl_name, tpl_gray)
+        core.imwrite(recipe_dir / mask_name, mask)
+        new_node = {
+            "type": "tap",
+            "label": label.strip(),
+            "template": tpl_name,
+            "mask": mask_name,
+            "context": fname,  # 元の失敗履歴画像をそのまま参考画像として使う
+            "x": cx, "y": cy, "dx": dx, "dy": dy,
+            "method": "masked_zncc",
+            "threshold": 0.85,
+        }
+        (data["popups"] if as_popup else data["steps"]).append(new_node)
+        core.save_recipe(name, data)
+        kind_label = "共通ポップアップ" if as_popup else "ステップ"
+        self.append(f"失敗履歴の画像から新しい{kind_label}「{label.strip()}」を追加しました（{name}）")
+        self.refresh_history()
+
     def on_retake_from_rank(self):
         """「よく止まる箇所」ランキングで選んだ行のステップを、記録画面を
         開いて直接撮り直しへ進める(【併せて】のショートカット)"""
@@ -1948,7 +3417,11 @@ class MainWindow(QtWidgets.QWidget):
             self.sp_to.value(), self.sp_after.value(),
             self.sp_poll.value(), self.sp_jitter.value(), self.sp_fail.value(),
             verify=self.ck_verify.isChecked(), tap_retry=3,
-            hold_ms=self.sp_hold.value()
+            hold_ms=self.sp_hold.value(),
+            notify_fail=self.ck_notify_fail.isChecked(),
+            notify_done=self.ck_notify_done.isChecked(),
+            notify_disconnect=self.ck_notify_disconnect.isChecked(),
+            notify_stall=self.ck_notify_stall.isChecked(),
         )
         self.worker.sig_log.connect(self.append)
         self.worker.sig_cycle.connect(

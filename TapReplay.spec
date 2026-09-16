@@ -10,6 +10,14 @@ tmp_ret = collect_all('adbutils')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('cv2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# windows-toasts(トースト通知)とその依存であるwinrt(pywinrt)。winrtは
+# .pyd拡張モジュールを名前空間パッケージ直下に置く構成で、collect_all無しだと
+# PyInstallerの解決に失敗し「開発環境では動くがexeでは無反応」になることを
+# 実機ビルドで確認したため、両方ともcollect_allで明示的に同梱する
+tmp_ret = collect_all('windows_toasts')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('winrt')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
