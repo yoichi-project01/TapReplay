@@ -124,6 +124,40 @@ def groupbox_help(tip):
     return row
 
 
+def format_duration(seconds):
+    """秒数を「1時間23分」「4分5秒」「12秒」のような読みやすい表記にする
+    (進捗表示の経過時間・1周あたりの平均時間に使う)"""
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}時間{m}分"
+    if m:
+        return f"{m}分{s}秒"
+    return f"{s}秒"
+
+
+def make_collapsible_box(title, checked=False):
+    """折りたたみ可能なQGroupBoxを作る。QGroupBox.setCheckable(True)の
+    チェック状態を「開いているか(中身を表示しているか)」として使う、
+    既存のQt部品だけで実現する簡単な方法。日常的には触らない詳細設定を
+    既定で畳んでおき、必要なときだけ開けるようにするために使う。
+
+    戻り値は (box, 中身を配置するQGridLayout)。boxをそのまま親レイアウトへ
+    addWidgetし、中身は戻り値のgridへaddWidget(w, row, col)で追加すること"""
+    box = QtWidgets.QGroupBox(title)
+    box.setCheckable(True)
+    box.setChecked(checked)
+    inner = QtWidgets.QWidget()
+    grid = QtWidgets.QGridLayout(inner)
+    outer = QtWidgets.QVBoxLayout(box)
+    outer.setContentsMargins(0, 4, 0, 0)
+    outer.addWidget(inner)
+    inner.setVisible(checked)
+    box.toggled.connect(inner.setVisible)
+    return box, grid
+
+
 # ============================================ クリックできる画像ラベル
 class ClickableLabel(QtWidgets.QLabel):
     """画面プレビュー上のクリック/ドラッグを検出する。
@@ -2085,6 +2119,7 @@ class ScreenCropDialog(QtWidgets.QDialog):
 class PlayerThread(QtCore.QThread):
     sig_log = QtCore.Signal(str)
     sig_cycle = QtCore.Signal(int, int, int)   # (成功, 失敗, 不完全)
+    sig_progress = QtCore.Signal(int, int, float, float)  # (今の周, 目標周(0=無限), 経過秒, 平均秒/周)
     sig_done = QtCore.Signal()
 
     # 共通ポップアップの探索を間引く最小間隔(秒)。実測(1920x1080画面 x
@@ -2805,6 +2840,7 @@ class PlayerThread(QtCore.QThread):
                         else:
                             raise ValueError(f"未知のノードtypeです: {ntype!r}")
                     avg = (time.time() - started) / cycle
+                    elapsed = time.time() - started
                     if skipped_this_cycle:
                         # スキップで途中のステップを飛ばした周は、実際には
                         # 手順通りに動いたか確認できていないため「成功」に
@@ -2813,6 +2849,7 @@ class PlayerThread(QtCore.QThread):
                         # 集計されてしまった事例を確認したため)
                         incomplete += 1
                         self.sig_cycle.emit(ok, ng_total, incomplete)
+                        self.sig_progress.emit(cycle, self.loops, elapsed, avg)
                         self._log(
                             f"=== ループ {cycle} 完了(スキップあり・不完全扱い) "
                             f"平均 {avg:.0f}秒/回 ===")
@@ -2820,13 +2857,17 @@ class PlayerThread(QtCore.QThread):
                         ok += 1
                         ng_streak = 0  # 連続失敗カウントは成功したらリセット
                         self.sig_cycle.emit(ok, ng_total, incomplete)
+                        self.sig_progress.emit(cycle, self.loops, elapsed, avg)
                         self._log(f"=== ループ {cycle} 完了  平均 {avg:.0f}秒/回 ===")
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
                     ng_total += 1
                     ng_streak += 1
+                    avg = (time.time() - started) / cycle
+                    elapsed = time.time() - started
                     self.sig_cycle.emit(ok, ng_total, incomplete)
+                    self.sig_progress.emit(cycle, self.loops, elapsed, avg)
                     self._log(f"!! ループ {cycle} 失敗: {e}")
                     # 参考情報: マスクの有効画素率と記録時に算出したしきい値。
                     # マスクがほとんど残っていないステップは、そもそも画像認識に
@@ -2933,7 +2974,10 @@ class MainWindow(QtWidgets.QWidget):
         self.resize(560, 700)
         self.serial = None
         self.worker = None
-        # 設定(通知のON/OFFなど)は、recipesと同様exeのある場所を基準にした
+        self._connected = False
+        self._last_counts = (0, 0, 0)
+        # 設定(記録・再生の各数値、端末シリアル、最後に選んだレシピ名、
+        # 通知のON/OFFなど)は、recipesと同様exeのある場所を基準にした
         # settings.iniに保存する(exeフォルダごと配布・移動しても一緒に付いてくる)
         self.settings = QtCore.QSettings(
             str(core.SETTINGS_PATH), QtCore.QSettings.IniFormat)
@@ -2951,10 +2995,11 @@ class MainWindow(QtWidgets.QWidget):
         row.addWidget(with_help(
             self.btn_conn,
             "USBでつないだAndroid端末に接続します。モデル名と画面サイズが"
-            "表示されれば成功です。記録・再生の前に一度押してください。"))
+            "表示されれば成功です。記録・再生の前に押さなくても、"
+            "記録開始／再生開始を押した時点で未接続なら自動で接続を試みます。"))
         v.addLayout(row)
 
-        # レシピ名
+        # レシピ名 ＋ 設定リセット
         row = QtWidgets.QHBoxLayout()
         self.cmb_recipe = QtWidgets.QComboBox()
         self.cmb_recipe.setEditable(True)
@@ -2964,16 +3009,47 @@ class MainWindow(QtWidgets.QWidget):
             "記録・再生の対象となる名前です。recipes/<この名前>/ フォルダに"
             "保存されます。新しい名前を入力すれば新規レシピとして記録できます。"))
         row.addWidget(self.cmb_recipe, 1)
+        btn_reset_settings = QtWidgets.QPushButton("設定を初期値に戻す")
+        btn_reset_settings.clicked.connect(self.on_reset_settings)
+        row.addWidget(with_help(
+            btn_reset_settings,
+            "記録・再生タブの数値設定(切抜き幅/高さ、実行回数、しきい値の"
+            "調整、各種待ち時間など)を初期値に戻します。設定をいじりすぎて"
+            "動かなくなったときの復帰用です。レシピ名・端末シリアル・通知の"
+            "ON/OFFは変更しません。"))
         v.addLayout(row)
 
         # タブ（記録設定 / 再生設定）
         tabs = QtWidgets.QTabWidget()
 
         # --- 記録タブ ---
+        # よく使う操作(記録開始・分岐を編集)を上に、日常的には触らない
+        # 切り抜きサイズは「詳細設定」として畳んでおく(既定で閉じた状態でも
+        # ボタンは常に見えるよう、ボタンは詳細設定の外に置く)
         tab_rec = QtWidgets.QWidget()
         tv = QtWidgets.QVBoxLayout(tab_rec)
-        box = QtWidgets.QGroupBox("記録の設定（画面をクリックして記録）")
-        g = QtWidgets.QGridLayout(box)
+        tv.addLayout(groupbox_help(
+            "端末の画面をPC上でクリックして、操作手順(レシピ)を記録します。"))
+
+        box = QtWidgets.QGroupBox("記録")
+        g = QtWidgets.QVBoxLayout(box)
+        self.btn_rec = QtWidgets.QPushButton("記録開始")
+        self.btn_rec.clicked.connect(self.on_record)
+        g.addWidget(with_help(
+            self.btn_rec,
+            "上のレシピ名で記録ウィンドウを開きます。既に記録済みのレシピ名を"
+            "指定した場合は、続きから追加記録するか選べます。未接続なら"
+            "自動で端末への接続を試みます。"))
+        self.btn_edit_structure = QtWidgets.QPushButton("分岐を編集")
+        self.btn_edit_structure.clicked.connect(self.on_edit_structure)
+        g.addWidget(with_help(
+            self.btn_edit_structure,
+            "上のレシピ名で記録済みのレシピを開き、if/elseの分岐構造を編集"
+            "します。端末には接続しません(記録済みの画像を使って画面上で"
+            "組み立てるだけです)。"))
+        tv.addWidget(box)
+
+        box_adv, g = make_collapsible_box("詳細設定（切り抜きサイズ）")
         self.sp_w = QtWidgets.QSpinBox(); self.sp_w.setRange(40, 800); self.sp_w.setValue(200)
         self.sp_h = QtWidgets.QSpinBox(); self.sp_h.setRange(40, 800); self.sp_h.setValue(100)
         g.addWidget(help_label(
@@ -2987,28 +3063,19 @@ class MainWindow(QtWidgets.QWidget):
         g.addWidget(self.sp_w, 0, 1)
         g.addWidget(help_label("高さ", "切り抜く縦幅(ピクセル)です。考え方は「切抜き幅」と同じです。"), 0, 2)
         g.addWidget(self.sp_h, 0, 3)
-        self.btn_rec = QtWidgets.QPushButton("記録開始")
-        self.btn_rec.clicked.connect(self.on_record)
-        g.addWidget(with_help(
-            self.btn_rec,
-            "上のレシピ名で記録ウィンドウを開きます。既に記録済みのレシピ名を"
-            "指定した場合は、続きから追加記録するか選べます。"), 1, 0, 1, 4)
-        self.btn_edit_structure = QtWidgets.QPushButton("分岐を編集")
-        self.btn_edit_structure.clicked.connect(self.on_edit_structure)
-        g.addWidget(with_help(
-            self.btn_edit_structure,
-            "上のレシピ名で記録済みのレシピを開き、if/elseの分岐構造を編集"
-            "します。端末には接続しません(記録済みの画像を使って画面上で"
-            "組み立てるだけです)。"), 2, 0, 1, 4)
-        tv.addLayout(groupbox_help(
-            "端末の画面をPC上でクリックして、操作手順(レシピ)を記録します。"))
-        tv.addWidget(box)
+        tv.addWidget(box_adv)
         tv.addStretch(1)
         tabs.addTab(tab_rec, "記録")
 
         # --- 再生タブ ---
+        # 日常的に触るのは実行回数・しきい値調整くらいで、残りは不調時だけ
+        # 調整する値なので「詳細設定」として畳んでおく(既定で閉じた状態)。
+        # 折りたたんだ状態でも再生開始ボタンはすぐ押せるよう、ボタンは
+        # 詳細設定の外に置く
         tab_play = QtWidgets.QWidget()
         pv = QtWidgets.QVBoxLayout(tab_play)
+        pv.addLayout(groupbox_help("記録したレシピを自動で繰り返し実行します。"))
+
         box = QtWidgets.QGroupBox("再生の設定")
         g = QtWidgets.QGridLayout(box)
         self.sp_loops = QtWidgets.QSpinBox(); self.sp_loops.setRange(0, 100000); self.sp_loops.setValue(0)
@@ -3016,12 +3083,6 @@ class MainWindow(QtWidgets.QWidget):
         self.sp_thr_offset.setRange(-0.2, 0.2)
         self.sp_thr_offset.setSingleStep(0.01)
         self.sp_thr_offset.setValue(0.0)
-        self.sp_to = QtWidgets.QSpinBox(); self.sp_to.setRange(5, 3600); self.sp_to.setValue(300)
-        self.sp_after = QtWidgets.QDoubleSpinBox(); self.sp_after.setRange(0, 20); self.sp_after.setValue(1.2)
-        self.sp_poll = QtWidgets.QDoubleSpinBox(); self.sp_poll.setRange(0.3, 10); self.sp_poll.setValue(1.5)
-        self.sp_fail = QtWidgets.QSpinBox(); self.sp_fail.setRange(1, 50); self.sp_fail.setValue(3)
-        self.sp_hold = QtWidgets.QSpinBox(); self.sp_hold.setRange(0, 1000); self.sp_hold.setValue(0)
-        self.sp_jitter = QtWidgets.QSpinBox(); self.sp_jitter.setRange(0, 100); self.sp_jitter.setValue(6)
         g.addWidget(help_label(
             "実行回数(0=無限)",
             "再生を何回繰り返すかを指定します。0にすると「停止」を押すまで"
@@ -3037,52 +3098,63 @@ class MainWindow(QtWidgets.QWidget):
             "\n※ステップごとのしきい値を持たない古い形式のレシピでは、"
             "この値がそのまま一致しきい値として使われます。"), 0, 2)
         g.addWidget(self.sp_thr_offset, 0, 3)
+        pv.addWidget(box)
+
+        box_adv, g = make_collapsible_box("詳細設定（普段は調整不要。うまく動かない時だけ）")
+        self.sp_to = QtWidgets.QSpinBox(); self.sp_to.setRange(5, 3600); self.sp_to.setValue(300)
+        self.sp_after = QtWidgets.QDoubleSpinBox(); self.sp_after.setRange(0, 20); self.sp_after.setValue(1.2)
+        self.sp_poll = QtWidgets.QDoubleSpinBox(); self.sp_poll.setRange(0.3, 10); self.sp_poll.setValue(1.5)
+        self.sp_fail = QtWidgets.QSpinBox(); self.sp_fail.setRange(1, 50); self.sp_fail.setValue(3)
+        self.sp_hold = QtWidgets.QSpinBox(); self.sp_hold.setRange(0, 1000); self.sp_hold.setValue(0)
+        self.sp_jitter = QtWidgets.QSpinBox(); self.sp_jitter.setRange(0, 100); self.sp_jitter.setValue(6)
         g.addWidget(help_label(
             "各ステップ最大待ち秒",
             "1つのステップの画像が現れるまで待つ最大時間(秒)。この時間を"
-            "過ぎても見つからなければ、そのステップは失敗として扱われます。"), 1, 0)
-        g.addWidget(self.sp_to, 1, 1)
+            "過ぎても見つからなければ、そのステップは失敗として扱われます。"), 0, 0)
+        g.addWidget(self.sp_to, 0, 1)
         g.addWidget(help_label(
             "タップ後待ち秒",
             "ボタンをタップしてから、効いたか(消えたか)を確認するまでの"
-            "待ち時間(秒)。画面の反応が遅いアプリでは長めにしてください。"), 1, 2)
-        g.addWidget(self.sp_after, 1, 3)
+            "待ち時間(秒)。画面の反応が遅いアプリでは長めにしてください。"), 0, 2)
+        g.addWidget(self.sp_after, 0, 3)
         g.addWidget(help_label(
             "確認間隔秒",
             "対象のボタンがまだ現れていないとき、何秒おきに画面を確認しに"
-            "いくかの間隔です。"), 2, 0)
-        g.addWidget(self.sp_poll, 2, 1)
+            "いくかの間隔です。"), 1, 0)
+        g.addWidget(self.sp_poll, 1, 1)
         g.addWidget(help_label(
             "連続失敗で停止",
             "同じレシピの再生が連続で何回失敗したら、再生全体を停止するかの"
-            "回数です。途中で1回でも成功すればこのカウントはリセットされます。"), 2, 2)
-        g.addWidget(self.sp_fail, 2, 3)
+            "回数です。途中で1回でも成功すればこのカウントはリセットされます。"), 1, 2)
+        g.addWidget(self.sp_fail, 1, 3)
         g.addWidget(help_label(
             "タップ長押しms(効かない時↑)",
             "タップを押している時間(ミリ秒)。0は瞬間タップ。反応が悪い"
             "アプリではタップしても無反応になりやすいので、80〜150くらいに"
-            "上げると改善することがあります。"), 3, 0)
-        g.addWidget(self.sp_hold, 3, 1)
+            "上げると改善することがあります。"), 2, 0)
+        g.addWidget(self.sp_hold, 2, 1)
         self.ck_verify = QtWidgets.QCheckBox("タップ後に効いたか確認して押し直す")
         self.ck_verify.setChecked(True)
         g.addWidget(with_help(
             self.ck_verify,
             "ONにすると、タップ後にボタンがまだ画面に残っているか確認し、"
             "残っていれば同じ場所を押し直します。OFFにすると1回タップした"
-            "だけで確認せずに次のステップへ進みます。"), 3, 2, 1, 2)
+            "だけで確認せずに次のステップへ進みます。"), 2, 2, 1, 2)
         g.addWidget(help_label(
             "タップ位置のばらつきpx",
             "タップする座標を毎回この範囲内でランダムにずらす量(ピクセル)。"
             "0にすると常に全く同じ座標をタップします。同じ場所ばかり連打する"
             "ことで一部のアプリの不正操作対策に引っかかるのを避けるためのもので、"
-            "通常は初期値のままで問題ありません。"), 4, 0)
-        g.addWidget(self.sp_jitter, 4, 1)
+            "通常は初期値のままで問題ありません。"), 3, 0)
+        g.addWidget(self.sp_jitter, 3, 1)
+        pv.addWidget(box_adv)
+
         self.btn_play = QtWidgets.QPushButton("再生開始")
         self.btn_play.clicked.connect(self.on_play)
-        g.addWidget(with_help(
-            self.btn_play, "上で選んだレシピを、この設定で再生します。"), 5, 0, 1, 4)
-        pv.addLayout(groupbox_help("記録したレシピを自動で繰り返し実行します。"))
-        pv.addWidget(box)
+        pv.addWidget(with_help(
+            self.btn_play,
+            "上で選んだレシピを、この設定で再生します。未接続なら自動で"
+            "端末への接続を試みます。"))
 
         box = QtWidgets.QGroupBox("通知(放置実行中の状況をWindowsのトースト通知でお知らせ)")
         ng = QtWidgets.QGridLayout(box)
@@ -3130,14 +3202,6 @@ class MainWindow(QtWidgets.QWidget):
         cv.addWidget(with_help(
             btn_refresh_content,
             "上のレシピ名で記録した内容を、この画面に読み込み直します。"))
-
-        btn_delete_recipe = QtWidgets.QPushButton("このレシピを削除する")
-        btn_delete_recipe.setStyleSheet("color: #b00000;")
-        btn_delete_recipe.clicked.connect(self.on_delete_recipe)
-        cv.addWidget(with_help(
-            btn_delete_recipe,
-            "レシピをフォルダごと完全に削除します。記録したステップ画像・"
-            "共通ポップアップ・失敗履歴もすべて消え、元に戻せません。"))
 
         box = QtWidgets.QGroupBox("記録したステップ")
         bl = QtWidgets.QVBoxLayout(box)
@@ -3188,6 +3252,21 @@ class MainWindow(QtWidgets.QWidget):
             "選んだ共通ポップアップをレシピから削除します。元に戻せません。"
             "テンプレート画像などのファイル自体は残ります。"))
         cv.addWidget(box, 1)
+
+        # 危険な操作(レシピ丸ごと削除)は、誤クリックしにくいようタブの
+        # 最下部に、区切り線を挟んで他の操作から視覚的に離して置く
+        cv.addStretch(0)
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setFrameShadow(QtWidgets.QFrame.Sunken)
+        cv.addWidget(sep)
+        btn_delete_recipe = QtWidgets.QPushButton("このレシピを削除する")
+        btn_delete_recipe.setStyleSheet("color: #b00000;")
+        btn_delete_recipe.clicked.connect(self.on_delete_recipe)
+        cv.addWidget(with_help(
+            btn_delete_recipe,
+            "レシピをフォルダごと完全に削除します。記録したステップ画像・"
+            "共通ポップアップ・失敗履歴もすべて消え、元に戻せません。"))
 
         tabs.addTab(tab_content, "記録内容")
 
@@ -3240,7 +3319,10 @@ class MainWindow(QtWidgets.QWidget):
         bl.addWidget(self.list_failures, 1)
         self.lbl_fail_preview = QtWidgets.QLabel("失敗履歴をクリックすると\nここに画像が表示されます")
         self.lbl_fail_preview.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_fail_preview.setMinimumSize(180, 180)
+        # 選択時は240px高さで表示する(on_failure_selected参照)ため実際の
+        # 表示はもっと大きくなるが、ここでの最小値は「何も選んでいない時の
+        # プレースホルダー」用。560x700の初期ウィンドウに収まるよう控えめにする
+        self.lbl_fail_preview.setMinimumSize(120, 120)
         self.lbl_fail_preview.setStyleSheet("background:#222; color:#aaa;")
         bl.addWidget(self.lbl_fail_preview, 1)
         fv.addLayout(groupbox_help(
@@ -3262,24 +3344,41 @@ class MainWindow(QtWidgets.QWidget):
         tabs.addTab(tab_fail, "失敗履歴")
 
         self._load_notify_settings()
+        self._load_settings()
+        self._wire_settings_autosave()
 
         self.tabs = tabs
         tabs.currentChanged.connect(self.on_tab_changed)
 
         v.addWidget(tabs)
 
-        # 停止・状態
+        # 接続状態・停止
         row = QtWidgets.QHBoxLayout()
         self.btn_stop = QtWidgets.QPushButton("停止")
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_stop.setEnabled(False)
-        self.lbl_stat = QtWidgets.QLabel("未接続")
+        self.lbl_stat = QtWidgets.QLabel()
         row.addWidget(with_help(
             self.btn_stop,
             "実行中の記録・再生を止めます。再生中はキリの良いところで"
             "止まるまで少し時間がかかることがあります。"))
         row.addWidget(self.lbl_stat, 1)
         v.addLayout(row)
+        self._set_connection_status("disconnected", "未接続")
+
+        # 再生の進捗(周回・経過時間)。再生していない間は空欄
+        row = QtWidgets.QHBoxLayout()
+        self.lbl_progress = QtWidgets.QLabel()
+        self.lbl_progress.setStyleSheet("font-weight: bold;")
+        row.addWidget(self.lbl_progress, 1)
+        self.lbl_timing = QtWidgets.QLabel()
+        row.addWidget(self.lbl_timing)
+        v.addLayout(row)
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setMaximumHeight(8)
+        v.addWidget(self.progress_bar)
 
         # ログ
         self.log = QtWidgets.QPlainTextEdit()
@@ -3301,6 +3400,13 @@ class MainWindow(QtWidgets.QWidget):
                 "別の場所へコピーすると、この状態になります。")
         else:
             self.append(f"adb: {core.ADB} ({core.ADB_SOURCE})")
+            # 起動時に一度だけ自動接続を試みる(バックグラウンドスレッドで
+            # 行うため、ウィンドウの表示は妨げない)。失敗しても起動プロセス
+            # 自体には影響しない(単に「未接続」のまま起動するだけ)
+            self._startup_connect_thread = DeviceConnectThread(self.ed_serial.text().strip() or None)
+            self._startup_connect_thread.sig_ok.connect(self._on_startup_connected)
+            self._startup_connect_thread.sig_error.connect(self._on_startup_connect_failed)
+            self._startup_connect_thread.start()
 
     # ------------------------------------------------------------ 動作
     def append(self, msg):
@@ -3322,6 +3428,14 @@ class MainWindow(QtWidgets.QWidget):
                 self.append(
                     "!! 再生スレッドが5秒以内に停止しませんでした。"
                     "終了処理を続行します")
+        # 起動直後、自動接続スレッド(DeviceConnectThread)がまだ動いている間に
+        # ウィンドウを閉じると、実行中のQThreadを破棄することになりQtが
+        # クラッシュする恐れがある。stop()できる作りではないので、ここでは
+        # 完了を待つ(通常は接続試行が数秒で終わるため、実害のある待ちには
+        # ならない)
+        t = getattr(self, "_startup_connect_thread", None)
+        if t is not None and t.isRunning():
+            t.wait(5000)
         event.accept()
 
     def _load_notify_settings(self):
@@ -3344,15 +3458,118 @@ class MainWindow(QtWidgets.QWidget):
         self.settings.setValue("notify/disconnect", self.ck_notify_disconnect.isChecked())
         self.settings.setValue("notify/stall", self.ck_notify_stall.isChecked())
 
+    # 「設定を初期値に戻す」で戻す対象(記録・再生タブの数値設定のみ。
+    # レシピ名・端末シリアル・通知ON/OFFは対象外。値は各ウィジェット
+    # 生成時に指定している初期値と揃えてある)
+    _RESET_DEFAULTS_SPIN = (
+        # (widget属性名, settingsキー, 初期値)
+        ("sp_w", "record/crop_w", 200),
+        ("sp_h", "record/crop_h", 100),
+        ("sp_loops", "play/loops", 0),
+        ("sp_thr_offset", "play/threshold_offset", 0.0),
+        ("sp_to", "play/timeout", 300),
+        ("sp_after", "play/after", 1.2),
+        ("sp_poll", "play/poll", 1.5),
+        ("sp_fail", "play/fail_streak", 3),
+        ("sp_hold", "play/hold_ms", 0),
+        ("sp_jitter", "play/jitter", 6),
+    )
+
+    def _load_settings(self):
+        """記録・再生タブの数値設定、端末シリアル、最後に選んでいたレシピ名を
+        settings.iniから読み込んで復元する(放置周回ツールとして、起動の
+        たびに設定し直さずに済むようにするため)"""
+        for attr, key, default in self._RESET_DEFAULTS_SPIN:
+            w = getattr(self, attr)
+            w.blockSignals(True)
+            value_type = float if isinstance(default, float) else int
+            w.setValue(self.settings.value(key, default, type=value_type))
+            w.blockSignals(False)
+        self.ck_verify.blockSignals(True)
+        self.ck_verify.setChecked(self.settings.value("play/verify", True, type=bool))
+        self.ck_verify.blockSignals(False)
+        self.ed_serial.blockSignals(True)
+        self.ed_serial.setText(self.settings.value("device/serial", "", type=str))
+        self.ed_serial.blockSignals(False)
+        last_recipe = self.settings.value("recipe/last", "", type=str)
+        if last_recipe:
+            self.cmb_recipe.blockSignals(True)
+            if self.cmb_recipe.findText(last_recipe) < 0:
+                self.cmb_recipe.addItem(last_recipe)
+            self.cmb_recipe.setCurrentText(last_recipe)
+            self.cmb_recipe.blockSignals(False)
+
+    def _wire_settings_autosave(self):
+        """各設定ウィジェットが変更されるたびに、そのままsettings.iniへ保存する
+        (通知ON/OFFの_save_notify_settingsと同じ方式。「保存」ボタンを
+        挟まない)"""
+        for attr, key, _default in self._RESET_DEFAULTS_SPIN:
+            w = getattr(self, attr)
+            w.valueChanged.connect(lambda v, key=key: self.settings.setValue(key, v))
+        self.ck_verify.toggled.connect(
+            lambda v: self.settings.setValue("play/verify", v))
+        self.ed_serial.textChanged.connect(
+            lambda t: self.settings.setValue("device/serial", t))
+        self.cmb_recipe.currentTextChanged.connect(
+            lambda t: self.settings.setValue("recipe/last", t))
+
+    def on_reset_settings(self):
+        resp = QtWidgets.QMessageBox.question(
+            self, "設定を初期値に戻す",
+            "記録・再生タブの数値設定(切抜き幅/高さ、実行回数、しきい値の"
+            "調整、各種待ち時間など)を初期値に戻します。\n"
+            "レシピ名・端末シリアル・通知のON/OFFは変更しません。\n"
+            "よろしいですか？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        for attr, _key, default in self._RESET_DEFAULTS_SPIN:
+            getattr(self, attr).setValue(default)
+        self.ck_verify.setChecked(True)
+        self.append("設定を初期値に戻しました")
+
+    def _set_connection_status(self, state, text):
+        """接続状態を色付きで示す。state: 'connected'(緑)/'disconnected'(灰)/
+        'error'(赤)。未接続に気づかず記録・再生を試みて戸惑う、という状況を
+        減らすための表示(【UI改善: 接続状態を分かりやすくする】)"""
+        colors = {"connected": "#1a7a1a", "disconnected": "#777777", "error": "#b00000"}
+        self._connected = (state == "connected")
+        self.lbl_stat.setText(text)
+        self.lbl_stat.setStyleSheet(f"color: {colors[state]}; font-weight: bold;")
+
+    def _ensure_connected(self):
+        """記録開始・再生開始が押された時点で未接続なら、エラーにする前に
+        自動で接続を試みる。成功すればそのまま処理を続け、失敗した場合のみ
+        呼び出し元がエラーとして扱う"""
+        if self._connected:
+            return True
+        self.append("未接続のため、自動で端末への接続を試みます…")
+        self.on_connect()
+        return self._connected
+
+    def _on_startup_connected(self, d, sw, sh, pil):
+        info = d.device_info
+        self._set_connection_status(
+            "connected", f"接続: {info.get('model')}  {(sw, sh)}")
+        self.append(f"起動時の自動接続に成功しました: {info.get('model')} / {d.serial}")
+
+    def _on_startup_connect_failed(self, message):
+        # 起動時点では端末がまだ繋がっていないことも多いので、警告ではなく
+        # 情報としてログに残すだけに留める(起動自体は妨げない)
+        self.append(f"起動時の自動接続はできませんでした({message})。"
+                     "「接続」を押すか、記録・再生開始時に改めて自動接続を試みます")
+
     def on_connect(self):
         self.serial = self.ed_serial.text().strip() or None
         try:
             d = core.connect(self.serial)
             info = d.device_info
-            self.lbl_stat.setText(f"接続: {info.get('model')}  {d.window_size()}")
+            self._set_connection_status(
+                "connected", f"接続: {info.get('model')}  {d.window_size()}")
             self.append(f"接続成功: {info.get('model')} / {d.serial}")
         except Exception as e:
-            self.lbl_stat.setText("接続失敗")
+            self._set_connection_status("error", "接続失敗")
             self.append(f"!! 接続失敗: {e}")
 
     def _busy(self, busy):
@@ -3368,6 +3585,9 @@ class MainWindow(QtWidgets.QWidget):
             return
         if not is_valid_recipe_name(name):
             self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
+            return
+        if not self._ensure_connected():
+            self.append("!! 端末に接続できないため、記録を開始できません")
             return
         try:
             # RecorderDialog()はUI構築のみで端末通信を行わないため、ここは
@@ -3569,9 +3789,13 @@ class MainWindow(QtWidgets.QWidget):
         if not is_valid_recipe_name(name):
             self.append(f"!! レシピ名に使えない文字が含まれています: {INVALID_NAME_CHARS}")
             return
+        if not self._ensure_connected():
+            self.append("!! 端末に接続できないため、再生を開始できません")
+            return
+        loops = self.sp_loops.value()
         self.worker = PlayerThread(
             self.serial, name,
-            self.sp_loops.value(), self.sp_thr_offset.value(),
+            loops, self.sp_thr_offset.value(),
             self.sp_to.value(), self.sp_after.value(),
             self.sp_poll.value(), self.sp_jitter.value(), self.sp_fail.value(),
             verify=self.ck_verify.isChecked(), tap_retry=3,
@@ -3581,14 +3805,40 @@ class MainWindow(QtWidgets.QWidget):
             notify_disconnect=self.ck_notify_disconnect.isChecked(),
             notify_stall=self.ck_notify_stall.isChecked(),
         )
+        self._last_counts = (0, 0, 0)
+        self.lbl_progress.setText(f"0 / {loops} 周目" if loops else "開始しています…")
+        self.lbl_timing.setText("")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(bool(loops))
+        if loops:
+            self.progress_bar.setRange(0, loops)
         self.worker.sig_log.connect(self.append)
-        self.worker.sig_cycle.connect(
-            lambda ok, ng, incomplete: self.lbl_stat.setText(
-                f"成功 {ok} / 失敗 {ng} / 不完全 {incomplete}")
-        )
+        self.worker.sig_cycle.connect(self.on_cycle_update)
+        self.worker.sig_progress.connect(self.on_progress_update)
         self.worker.sig_done.connect(self.on_worker_done)
         self._busy(True)
         self.worker.start()
+
+    def on_cycle_update(self, ok, ng, incomplete):
+        # sig_progressと対になって同じ瞬間に発火するので、ここでは値を
+        # 覚えておくだけにし、実際の表示更新はon_progress_updateで行う
+        self._last_counts = (ok, ng, incomplete)
+
+    def on_progress_update(self, cycle, loops, elapsed, avg):
+        """周回の進捗(今何周目か・経過時間・1周あたりの平均時間)を表示する。
+        値はPlayerThreadが既にログ用に算出しているものをそのまま使う"""
+        ok, ng, incomplete = self._last_counts
+        text = f"{cycle} / {loops} 周目" if loops else f"{cycle} 周目"
+        text += f"（成功{ok} / 失敗{ng} / 不完全{incomplete}）"
+        self.lbl_progress.setText(text)
+        self.lbl_timing.setText(
+            f"経過 {format_duration(elapsed)} ・ 平均 {format_duration(avg)}/周")
+        if loops:
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, loops)
+            self.progress_bar.setValue(min(cycle, loops))
+        else:
+            self.progress_bar.setVisible(False)
 
     def on_stop(self):
         if self.worker:
