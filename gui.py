@@ -1251,25 +1251,38 @@ class NodeTreeBuilder:
 
 class ConditionPickerDialog(QtWidgets.QDialog):
     """ifの条件として使う画像を選ぶ画面。フェーズ1a時点では新規撮影はせず、
-    既に撮影済みのステップのtemplate/mask/method/thresholdをそのまま
-    流用する(端末には一切接続しない)"""
+    既に撮影済みのステップ、または共通ポップアップとして登録済みの画像の
+    template/mask/method/thresholdをそのまま流用する(端末には一切接続しない)"""
 
-    def __init__(self, recipe_dir, steps, parent=None):
+    def __init__(self, recipe_dir, steps, popups=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("条件画像を選択")
-        self.resize(420, 520)
+        self.resize(420, 560)
         self.recipe_dir = recipe_dir
+        self.popups = popups if popups is not None else []
         self._extra_result = None  # 失敗履歴から作った場合の合成ステップ
+
+        # 一覧の各行(ステップ・共通ポップアップの両方)に対応する
+        # ("step"|"popup", 元のdict) を、Qtの行番号と同じ順序で保持する。
+        # QListWidgetItem.setData(UserRole, dict)は、PySide6ではQVariant
+        # 経由で中身が複製されるだけで元のオブジェクトと同一ではなくなる
+        # (実測で確認済み。BlockTreeWidgetが側テーブルを使っているのと同じ
+        # 理由)。共通ポップアップを選んだ場合はself.popupsから同一の
+        # オブジェクトをis比較で安全に取り除きたいため、Qt側のデータ機構
+        # ではなくこちらのPython側リストで管理する
+        self._entries = []
 
         v = QtWidgets.QVBoxLayout(self)
         v.addWidget(QtWidgets.QLabel(
-            "条件として使う画像(既に撮影済みのステップ)を選んでください:"))
+            "条件として使う画像を選んでください(記録済みのステップ、"
+            "または共通ポップアップとして登録済みの画像):"))
 
         self.list = QtWidgets.QListWidget()
         self.list.setIconSize(QtCore.QSize(48, 48))
-        for step in steps:
-            item = QtWidgets.QListWidgetItem(step.get("label", "?"))
-            ctx = step.get("context")
+
+        def add_entry(kind, obj, prefix=""):
+            item = QtWidgets.QListWidgetItem(f"{prefix}{obj.get('label', '?')}")
+            ctx = obj.get("context")
             if ctx:
                 path = recipe_dir / ctx
                 if path.exists():
@@ -1278,8 +1291,21 @@ class ConditionPickerDialog(QtWidgets.QDialog):
                         pix = pix.scaled(48, 48, QtCore.Qt.KeepAspectRatio,
                                           QtCore.Qt.SmoothTransformation)
                         item.setIcon(QtGui.QIcon(pix))
-            item.setData(QtCore.Qt.UserRole, step)
             self.list.addItem(item)
+            self._entries.append((kind, obj))
+
+        for step in steps:
+            add_entry("step", step)
+        if self.popups:
+            header = QtWidgets.QListWidgetItem("── 共通ポップアップ ──")
+            header.setFlags(QtCore.Qt.ItemIsEnabled)  # 選択不可の見出し行
+            font = header.font()
+            font.setItalic(True)
+            header.setFont(font)
+            self.list.addItem(header)
+            self._entries.append((None, None))  # 見出し行の分だけ_entriesの行番号を揃える
+            for popup in self.popups:
+                add_entry("popup", popup, prefix="[ポップアップ] ")
         v.addWidget(self.list, 1)
 
         b_from_failure = QtWidgets.QPushButton("失敗履歴の画像から選ぶ...")
@@ -1356,26 +1382,62 @@ class ConditionPickerDialog(QtWidgets.QDialog):
         }
         self.accept()
 
+    def _current_entry(self):
+        row = self.list.currentRow()
+        if not (0 <= row < len(self._entries)):
+            return None, None
+        return self._entries[row]  # (kind, obj) または見出し行なら (None, None)
+
+    def accept(self):
+        # 共通ポップアップの画像を条件に選んだ場合、そのままだと再生時に
+        # 「共通ポップアップ」の割り込み処理がifの条件判定より先に画面を
+        # 閉じてしまい、条件が常に不成立になりかねない
+        # (【共通ポップアップを条件に使う】参照)。この場に気づける唯一の
+        # タイミングなので、選択を確定する瞬間に確認する。
+        # _extra_result(失敗履歴からの合成)経由のacceptでは、一覧側の選択は
+        # 無関係(たまたま以前選んでいた行が残っているだけ)なので対象外
+        kind, obj = (None, None) if self._extra_result is not None else self._current_entry()
+        if kind == "popup":
+            resp = QtWidgets.QMessageBox.question(
+                self, "共通ポップアップを条件に使う",
+                f"「{obj.get('label', '?')}」は共通ポップアップとして登録されています。\n\n"
+                "登録したままだと、再生中はこの画像が条件判定に到達するより先に"
+                "「共通ポップアップ」の割り込み処理で閉じられてしまうため、"
+                "この if の条件は常に不成立になる可能性があります。\n\n"
+                "共通ポップアップの登録から外しますか？\n"
+                "(画像ファイル自体は残ります。「いいえ」を選んでも条件としては"
+                "使えますが、上記の理由でうまく動かない可能性があります)",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes)
+            if resp == QtWidgets.QMessageBox.Yes:
+                # list.remove()の==一致ではなく、is比較で同一オブジェクトのみを
+                # 取り除く(内容が偶然同じ別のポップアップを誤って消さないため。
+                # on_delete_selectedと同じ考え方)
+                for i, p in enumerate(self.popups):
+                    if p is obj:
+                        del self.popups[i]
+                        break
+        super().accept()
+
     def result_value(self):
         if self._extra_result is not None:
             kind = "image_found" if self.rb_found.isChecked() else "image_not_found"
             return self._extra_result, kind
-        item = self.list.currentItem()
-        if item is None:
+        entry_kind, obj = self._current_entry()
+        if obj is None:
             return None
-        step = item.data(QtCore.Qt.UserRole)
         kind = "image_found" if self.rb_found.isChecked() else "image_not_found"
-        return step, kind
+        return obj, kind
 
     @staticmethod
-    def pick(parent, recipe_dir, steps):
-        if not steps:
+    def pick(parent, recipe_dir, steps, popups=None):
+        if not steps and not popups:
             QtWidgets.QMessageBox.warning(
                 parent, "選べる画像がありません",
-                "条件に使えるステップがまだありません。先に記録画面で"
-                "ステップを記録してください。")
+                "条件に使えるステップ・共通ポップアップがまだありません。"
+                "先に記録画面で記録してください。")
             return None
-        dlg = ConditionPickerDialog(recipe_dir, steps, parent)
+        dlg = ConditionPickerDialog(recipe_dir, steps, popups, parent)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return None
         result = dlg.result_value()
@@ -1608,10 +1670,18 @@ class StructureEditorDialog(QtWidgets.QDialog):
             return
 
         picked = ConditionPickerDialog.pick(
-            self, self.recipe_dir, list(core.iter_tap_leaves(self.data["steps"])))
+            self, self.recipe_dir, list(core.iter_tap_leaves(self.data["steps"])),
+            self.data.get("popups", []))
         if picked is None:
             return
         step, kind = picked
+        # template/mask/method/thresholdは値をコピーする(stepオブジェクトへの
+        # 参照は持たない)。参照のままだと、後から元のステップ(または共通
+        # ポップアップ)を撮り直したときにファイル名が変わり、この条件の
+        # 判定内容が利用者の知らないところで勝手に変わってしまうため。
+        # 文字列・数値はPythonでは代入時点で値コピーになるので、ここでは
+        # 新しいdictを組み立てるだけでよい(stepの辞書オブジェクト自体は
+        # 参照しない)
         condition = {
             "kind": kind,
             "template": step["template"],
@@ -2787,6 +2857,22 @@ class PlayerThread(QtCore.QThread):
                     "!! 注意: 以下のステップは不正なしきい値(1.0超)で記録されて"
                     "います(過去の数値不具合が原因の可能性)。正しく検出できない"
                     f"ため撮り直しをおすすめします: {', '.join(broken_labels)}")
+            # if の条件と共通ポップアップが同じ画像(テンプレートファイル)を
+            # 使っている場合、共通ポップアップの割り込み処理が条件判定より
+            # 先に画面を閉じてしまい、その条件が常に不成立になりかねない
+            # (ConditionPickerDialogでの登録解除確認をすり抜けた場合の
+            # 保険として、再生開始時にも検出しておく)
+            popup_by_template = {p["template"]: p for p in popups if p.get("template")}
+            for if_node, cond in core.iter_if_conditions(data["steps"]):
+                tpl = cond.get("template")
+                if tpl and tpl in popup_by_template:
+                    self._log(
+                        f"!! 注意: 分岐「{if_node.get('label', '?')}」の条件は、"
+                        f"共通ポップアップ「{popup_by_template[tpl].get('label', '?')}」"
+                        f"と同じ画像({tpl})を使っています。共通ポップアップの"
+                        "割り込み処理が先に画面を閉じてしまうため、この条件は"
+                        "常に不成立になる可能性があります(共通ポップアップの登録を"
+                        "外すか、別の画像を条件にしてください)")
             self._log(f"再生開始: {len(tap_nodes)}ステップ"
                       f"（共通ポップアップ{len(popups)}件） / "
                       f"{'無限' if self.loops == 0 else self.loops}周")

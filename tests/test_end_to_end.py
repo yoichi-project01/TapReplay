@@ -44,7 +44,7 @@ b_item = dlg.tree.topLevelItem(1)
 c_item = dlg.tree.topLevelItem(2)
 b_item.setSelected(True)
 c_item.setSelected(True)
-gui.ConditionPickerDialog.pick = staticmethod(lambda parent, recipe_dir, steps: (
+gui.ConditionPickerDialog.pick = staticmethod(lambda parent, recipe_dir, steps, popups=None: (
     next(s for s in steps if s["label"] == "A"), "image_found"))
 QtWidgets.QInputDialog.getText = staticmethod(lambda *a, **kw: ("分岐AB", True))
 dlg.on_make_if()

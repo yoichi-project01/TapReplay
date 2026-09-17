@@ -473,6 +473,23 @@ def iter_referenced_images(nodes):
             yield from iter_referenced_images(node.get("body", []))
 
 
+def iter_if_conditions(nodes):
+    """steps(木構造)を深さ優先で辿り、(ifノード, そのcondition) のペアを
+    返すジェネレータ。ネストしたifの中のifも辿る(loop未対応)。
+
+    再生開始時に「条件判定に使っている画像が、共通ポップアップにも
+    登録されたままで、割り込み処理に先に閉じられて条件が常に不成立に
+    なりかねない」競合を検出するために使う(PlayerThread.run参照)"""
+    for node in nodes:
+        ntype = node.get("type", "tap")
+        if ntype == "if":
+            yield node, node.get("condition", {})
+            yield from iter_if_conditions(node.get("then", []))
+            yield from iter_if_conditions(node.get("else", []))
+        elif ntype == "loop":
+            yield from iter_if_conditions(node.get("body", []))
+
+
 def get_node_by_path(steps, path):
     """steps(木構造)上の1ノードを、(トップレベルindex, "then"/"else",
     ブロック内index, ...) の形のpathから取り出す。行番号のような「その場限り

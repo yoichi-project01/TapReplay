@@ -40,7 +40,7 @@ item3.setSelected(True)
 orig_pick = gui.ConditionPickerDialog.pick
 orig_get_text = QtWidgets.QInputDialog.getText
 gui.ConditionPickerDialog.pick = staticmethod(
-    lambda parent, recipe_dir, steps: (steps[0], "image_found"))
+    lambda parent, recipe_dir, steps, popups=None: (steps[0], "image_found"))
 QtWidgets.QInputDialog.getText = staticmethod(lambda *a, **kw: ("分岐A", True))
 
 dlg.on_make_if()
@@ -109,7 +109,7 @@ core.save_recipe(NAME2, {"device_size": [200, 200], "screenshot_size": [200, 200
 
 dlg3 = gui.StructureEditorDialog(NAME2)
 gui.ConditionPickerDialog.pick = staticmethod(
-    lambda parent, recipe_dir, steps: (steps[0], "image_found"))
+    lambda parent, recipe_dir, steps, popups=None: (steps[0], "image_found"))
 QtWidgets.QInputDialog.getText = staticmethod(lambda *a, **kw: ("L1", True))
 
 # depth1 -> if作成(中身はdepth2になる)
