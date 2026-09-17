@@ -23,6 +23,12 @@ import cv2
 import numpy as np
 import uiautomator2 as u2
 
+# アプリのバージョン番号。ここが唯一の定義場所(single source of truth)。
+# ウィンドウタイトル(gui.py)・起動ログ(gui.py)・配布用ZIPのファイル名
+# (build.bat / make_release_zip.ps1)がここを参照する。リリースのたびに
+# ここだけ更新すればよい
+VERSION = "1.0.0"
+
 # exe 化(PyInstaller)された場合は exe のある場所を基準にする。
 # そうしないと onefile 版では記録データが一時フォルダに保存され消えてしまう。
 if getattr(sys, "frozen", False):
