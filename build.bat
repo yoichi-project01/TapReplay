@@ -52,6 +52,31 @@ REM   - The release ZIP step (also end of the script) is the same: it
 REM     never fails the build for the same reason, and can be skipped
 REM     entirely by running "build.bat nozip" (handy for repeated builds
 REM     during development, where the ZIP is just wasted time).
+REM   - A running TapReplay.exe is checked for twice: once up front
+REM     (fails fast, before wasting minutes on a dependency install) and
+REM     again right before the recipes backup (in case someone started
+REM     the exe during that wait). Both checks jump to the same
+REM     :tapreplay_running label instead of being wrapped in a callable
+REM     subroutine - "exit /b" inside a "call"ed label only returns from
+REM     that call, it does not stop the whole script, so a shared
+REM     "goto" target is used instead to get a real hard stop.
+REM   - The recipes backup/restore (inside "Building with PyInstaller")
+REM     always checks the errorlevel of "move" now. It used to not check
+REM     it at all: if TapReplay.exe (or anything else) held a file open
+REM     under dist\TapReplay\recipes\, the backup "move" failed silently
+REM     and the script carried on to run PyInstaller anyway - which then
+REM     tried to delete that same locked folder itself and crashed with
+REM     a Python PermissionError (WinError 32). Confirmed on a real
+REM     build: gui.py's playback log is opened via plain open(path, "a"),
+REM     which on Windows does not set FILE_SHARE_DELETE, so any playback
+REM     log still open blocks rename/delete of the whole recipes\ tree.
+REM     The backup folder name also now includes a timestamp instead of
+REM     being fixed - a fixed name meant that if a *previous* run's
+REM     restore ever failed and left recipes sitting in the backup
+REM     folder, the *next* run's unconditional "rmdir /s /q" on that same
+REM     fixed path would silently destroy them before making its own
+REM     backup. A timestamped name means two runs never collide, so nothing
+REM     ever gets silently deleted by a later run.
 REM ===================================================================
 
 cd /d "%~dp0"
@@ -73,7 +98,13 @@ echo  TapReplay build
 echo ===================================================================
 
 echo.
-echo [1/7] Checking Python environment...
+echo [1/8] Checking for a running TapReplay.exe...
+tasklist /FI "IMAGENAME eq TapReplay.exe" 2>nul | find /I "TapReplay.exe" >nul
+if not errorlevel 1 goto :tapreplay_running
+echo No running TapReplay.exe found.
+
+echo.
+echo [2/8] Checking Python environment...
 where python >nul 2>&1
 if errorlevel 1 goto :no_python
 
@@ -101,6 +132,20 @@ if %PY_MAJOR% EQU 3 if %PY_MINOR% LSS %PY_MIN_MINOR% goto :py_too_old
 if %PY_MAJOR% GTR 3 goto :py_too_new
 if %PY_MAJOR% EQU 3 if %PY_MINOR% GTR %PY_MAX_MINOR% goto :py_too_new
 goto :py_ok
+
+:tapreplay_running
+echo.
+echo ERROR: TapReplay.exe is currently running.
+echo.
+echo PyInstaller needs to delete and rebuild dist\TapReplay\ from
+echo scratch, and it cannot do that while the running exe - or a file it
+echo has open under dist\TapReplay\recipes\ (for example an active
+echo playback log) - is locked. Building over a running instance risks
+echo losing or corrupting recorded recipes.
+echo.
+echo Close TapReplay.exe, then re-run build.bat.
+pause
+exit /b 1
 
 :no_python
 echo.
@@ -241,7 +286,7 @@ exit /b 1
 echo Python version OK.
 
 echo.
-echo [2/7] Checking whether dependencies are already installed...
+echo [3/8] Checking whether dependencies are already installed...
 call %PY_CMD% -c "import cv2, numpy, PIL, PySide6, uiautomator2, adbutils, PyInstaller" >nul 2>&1
 if errorlevel 1 goto :do_install
 echo All required packages are already importable. Skipping install.
@@ -275,7 +320,7 @@ if not "%PYI_ERR%"=="0" (
 
 :verify_imports
 echo.
-echo [3/7] Verifying that dependencies actually import...
+echo [4/8] Verifying that dependencies actually import...
 call %PY_CMD% -c "import cv2, numpy, PIL, PySide6, uiautomator2, adbutils" >nul 2>&1
 if errorlevel 1 goto :import_failed
 echo OK: all required packages are importable.
@@ -294,20 +339,56 @@ echo   %PY_CMD% -c "import cv2, numpy, PIL, PySide6, uiautomator2, adbutils"
 pause
 exit /b 1
 
+:backup_failed
+echo.
+echo ERROR: could not back up dist\TapReplay\recipes\ before building.
+echo.
+echo This usually means a file inside it is still open (for example
+echo TapReplay.exe, or an editor/antivirus holding a log or image file
+echo open). Building now would let PyInstaller delete that folder from
+echo scratch and could lose recorded recipes, so the build is stopped
+echo here instead - before anything was touched.
+echo.
+echo Close anything that might have a file open under
+echo dist\TapReplay\recipes\ and re-run build.bat.
+pause
+exit /b 1
+
 :do_build
 echo.
-echo [4/7] Building with PyInstaller...
+echo [5/8] Building with PyInstaller...
 
 REM Build settings live in TapReplay.spec (shared with watch_build.ps1).
 REM Edit TapReplay.spec instead of adding --onedir/icon/data flags here.
 
+REM Re-check right before the point of no return: the dependency install
+REM above can take several minutes, long enough for someone to start the
+REM app while waiting.
+tasklist /FI "IMAGENAME eq TapReplay.exe" 2>nul | find /I "TapReplay.exe" >nul
+if not errorlevel 1 goto :tapreplay_running
+
 REM PyInstaller rebuilds dist\TapReplay from scratch, so back up the
 REM recorded recipes (recipes\) here and restore them after the build.
+REM The backup folder name includes a timestamp (not a fixed name): a
+REM fixed name meant that if a *previous* run's restore ever failed and
+REM left recipes stranded in the backup folder, this run's own backup
+REM step would silently rmdir /s /q that same path (to make room for its
+REM own backup) before anyone noticed - destroying the stranded recipes.
+REM A per-run name means two runs never collide, so nothing prior is
+REM ever touched, let alone deleted.
 set "RECIPES_DIR=%~dp0dist\TapReplay\recipes"
-set "BACKUP_DIR=%TEMP%\TapReplay_recipes_backup"
+set "BACKUP_DIR="
 if exist "%RECIPES_DIR%" (
+    set "BACKUP_STAMP="
+    for /f "delims=" %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BACKUP_STAMP=%%T"
+    if not defined BACKUP_STAMP set "BACKUP_STAMP=fallback_%RANDOM%%RANDOM%"
+    set "BACKUP_DIR=%TEMP%\TapReplay_recipes_backup_%BACKUP_STAMP%"
     if exist "%BACKUP_DIR%" rmdir /s /q "%BACKUP_DIR%"
+
     move "%RECIPES_DIR%" "%BACKUP_DIR%" >nul
+    set "BACKUP_ERR=%errorlevel%"
+    if not "%BACKUP_ERR%"=="0" goto :backup_failed
+    if not exist "%BACKUP_DIR%" goto :backup_failed
 )
 
 call %PY_CMD% -m PyInstaller --noconfirm TapReplay.spec
@@ -317,14 +398,39 @@ REM (move, copy, ...) would otherwise overwrite it before we can check
 REM whether PyInstaller actually succeeded.
 set "BUILD_ERR=%errorlevel%"
 
-if exist "%BACKUP_DIR%" (
+REM Always attempt the restore, win or lose, so a PyInstaller failure
+REM never strands the backup on top of failing the build.
+set "RESTORE_ERR=0"
+if defined BACKUP_DIR (
     if exist "%RECIPES_DIR%" rmdir /s /q "%RECIPES_DIR%"
     move "%BACKUP_DIR%" "%RECIPES_DIR%" >nul
+    set "RESTORE_ERR=%errorlevel%"
 )
 
 if not "%BUILD_ERR%"=="0" (
     echo.
     echo Build failed. Check the errors above.
+    if not "%RESTORE_ERR%"=="0" (
+        echo.
+        echo In addition, your recorded recipes could not be restored.
+        echo They were NOT lost - they are still sitting at:
+        echo   %BACKUP_DIR%
+        echo Move that folder back to dist\TapReplay\recipes\ manually.
+    )
+    pause
+    exit /b 1
+)
+
+if not "%RESTORE_ERR%"=="0" (
+    echo.
+    echo ERROR: the exe built successfully, but recorded recipes could not
+    echo be restored into dist\TapReplay\recipes\ afterward ^(likely
+    echo something still has a file open under that folder^). Your
+    echo recipes were NOT lost - they are still sitting at:
+    echo   %BACKUP_DIR%
+    echo Move that folder back to dist\TapReplay\recipes\ manually, then
+    echo re-run build.bat if you want a clean dist\TapReplay\ with
+    echo recipes already in place.
     pause
     exit /b 1
 )
@@ -343,7 +449,7 @@ if not exist "%~dp0dist\TapReplay\THIRD_PARTY_LICENSES.txt" (
 )
 
 echo.
-echo [5/7] Verifying build output...
+echo [6/8] Verifying build output...
 set "DIST_DIR=%~dp0dist\TapReplay"
 set "DIST_OK=1"
 
@@ -376,7 +482,7 @@ if "%DIST_OK%"=="0" (
 )
 
 echo.
-echo [6/7] Creating desktop shortcut...
+echo [7/8] Creating desktop shortcut...
 
 REM This never fails the build: dist\TapReplay already verified OK above,
 REM so a shortcut problem is only a warning, not a build failure.
@@ -394,10 +500,10 @@ if not errorlevel 1 (
 
 echo.
 if "%SKIP_ZIP%"=="1" (
-    echo [7/7] Skipping release ZIP ^(build.bat was run with a nozip argument^).
+    echo [8/8] Skipping release ZIP ^(build.bat was run with a nozip argument^).
     goto :zip_done
 )
-echo [7/7] Creating release ZIP...
+echo [8/8] Creating release ZIP...
 
 REM VERSION lives in core.py (single source of truth - also shown in the
 REM window title and startup log). Dependencies were already verified
