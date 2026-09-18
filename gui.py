@@ -3056,7 +3056,7 @@ class PlayerThread(QtCore.QThread):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TapReplay — Android 記録＆再生")
+        self.setWindowTitle(f"TapReplay v{core.VERSION} — Android 記録＆再生")
         self.resize(560, 700)
         self.serial = None
         self.worker = None
@@ -3470,6 +3470,8 @@ class MainWindow(QtWidgets.QWidget):
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         v.addWidget(self.log, 1)
+
+        self.append(f"TapReplay v{core.VERSION} 起動")
 
         # 起動時にadbの解決結果を必ずログへ出す。実際に接続を試みるまで
         # 気づけないと、この種の問題は切り分けに時間がかかるため
