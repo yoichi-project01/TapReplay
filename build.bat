@@ -341,16 +341,9 @@ exit /b 1
 
 :backup_failed
 echo.
-echo ERROR: could not back up dist\TapReplay\recipes\ before building.
-echo.
-echo This usually means a file inside it is still open (for example
-echo TapReplay.exe, or an editor/antivirus holding a log or image file
-echo open). Building now would let PyInstaller delete that folder from
-echo scratch and could lose recorded recipes, so the build is stopped
-echo here instead - before anything was touched.
-echo.
-echo Close anything that might have a file open under
-echo dist\TapReplay\recipes\ and re-run build.bat.
+echo Build stopped before running PyInstaller - see the details above
+echo for exactly which file (and, if it could be determined, which
+echo program) is blocking it.
 pause
 exit /b 1
 
@@ -376,6 +369,18 @@ REM step would silently rmdir /s /q that same path (to make room for its
 REM own backup) before anyone noticed - destroying the stranded recipes.
 REM A per-run name means two runs never collide, so nothing prior is
 REM ever touched, let alone deleted.
+REM
+REM The actual copy/verify work is delegated to backup_recipes.ps1
+REM (invoked directly, not through a "for /f ... do set" capture, so its
+REM possibly multi-line diagnostics print straight to the console instead
+REM of only the last line surviving). It copies file-by-file rather than
+REM moving the whole folder in one shot, so a single locked file no
+REM longer fails the entire backup with just an opaque "Access is
+REM denied" - it reports exactly which file, and (best-effort, via the
+REM Restart Manager API) which process holds it. See that script for the
+REM full reasoning, including why even a locked *.log still blocks the
+REM build (PyInstaller's own cleanup cannot tolerate anything left behind
+REM either) despite being fine to lose on its own.
 set "RECIPES_DIR=%~dp0dist\TapReplay\recipes"
 set "BACKUP_DIR="
 if exist "%RECIPES_DIR%" (
@@ -385,10 +390,9 @@ if exist "%RECIPES_DIR%" (
     set "BACKUP_DIR=%TEMP%\TapReplay_recipes_backup_%BACKUP_STAMP%"
     if exist "%BACKUP_DIR%" rmdir /s /q "%BACKUP_DIR%"
 
-    move "%RECIPES_DIR%" "%BACKUP_DIR%" >nul
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0backup_recipes.ps1" -SourceDir "%RECIPES_DIR%" -BackupDir "%BACKUP_DIR%"
     set "BACKUP_ERR=%errorlevel%"
     if not "%BACKUP_ERR%"=="0" goto :backup_failed
-    if not exist "%BACKUP_DIR%" goto :backup_failed
 )
 
 call %PY_CMD% -m PyInstaller --noconfirm TapReplay.spec
