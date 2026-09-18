@@ -1,8 +1,30 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$SourceDir,
-    [Parameter(Mandatory = $true)][string]$BackupDir
+    # AllowEmptyString + a manual check further down (rather than relying
+    # on Mandatory's own default validation) is deliberate: a plain
+    # [string] Mandatory parameter already rejects an empty string, but
+    # with PowerShell's own generic
+    # "ParameterArgumentValidationErrorEmptyStringNotAllowed" message,
+    # which does not say this script is the one calling out the problem,
+    # nor point at build.bat as the likely source. Confirmed this exact
+    # message is what a caller passing "" produces.
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$SourceDir,
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$BackupDir
 )
+
+if ([string]::IsNullOrWhiteSpace($SourceDir) -or [string]::IsNullOrWhiteSpace($BackupDir)) {
+    Write-Output "ERROR: backup_recipes.ps1 was called with an empty -SourceDir or -BackupDir."
+    Write-Output "  SourceDir=[$SourceDir]"
+    Write-Output "  BackupDir=[$BackupDir]"
+    Write-Output "This is a bug in build.bat's own call to this script, not anything"
+    Write-Output "about your recipes or a locked file. If you just edited build.bat,"
+    Write-Output "look for a variable read with %VAR% inside the same '( ... )' block"
+    Write-Output "where it was set - without setlocal enabledelayedexpansion, that"
+    Write-Output "reads the value from before the block started, not what an earlier"
+    Write-Output "line in the same block just set. Re-run 'build.bat debug' to see"
+    Write-Output "what build.bat actually computed for these paths."
+    exit 1
+}
 
 # Called from build.bat before the PyInstaller build, to safely relocate
 # dist\TapReplay\recipes\ (user-recorded data) out of the way. PyInstaller

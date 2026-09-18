@@ -44,9 +44,12 @@ try {
 
     # Guide text file(s) at the repo root, e.g. the Japanese-named
     # "read this first" file for end users. Matched by extension so this
-    # script never needs to spell out a non-ASCII filename.
+    # script never needs to spell out a non-ASCII filename. requirements.txt
+    # is excluded alongside THIRD_PARTY_LICENSES.txt - it also matches
+    # "*.txt" and was confirmed (via a real build.bat run) to otherwise
+    # ship a developer-only pip dependency list to end users.
     Get-ChildItem -LiteralPath $RepoRoot -Filter "*.txt" -File |
-        Where-Object { $_.Name -ne "THIRD_PARTY_LICENSES.txt" } |
+        Where-Object { $_.Name -ne "THIRD_PARTY_LICENSES.txt" -and $_.Name -ne "requirements.txt" } |
         ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $stageApp }
 
     if (Test-Path -LiteralPath $OutputZip) {

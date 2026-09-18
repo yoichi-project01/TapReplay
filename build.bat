@@ -77,13 +77,38 @@ REM     folder, the *next* run's unconditional "rmdir /s /q" on that same
 REM     fixed path would silently destroy them before making its own
 REM     backup. A timestamped name means two runs never collide, so nothing
 REM     ever gets silently deleted by a later run.
+REM   - Every "set" in the backup/restore step that a later line reads
+REM     back with %VAR% is kept OUTSIDE of any "( ... )" block (using
+REM     "goto" to skip steps instead of "if (...) ( ... )"). Without
+REM     "setlocal enabledelayedexpansion", cmd.exe substitutes every
+REM     %VAR% in an entire "( ... )" block ONCE, using the values from
+REM     BEFORE the block started - not values any earlier line inside
+REM     that same block just set. A previous version of this exact
+REM     section set BACKUP_STAMP, BACKUP_DIR and BACKUP_ERR and then read
+REM     them back with %VAR% inside the same "if exist (...)" block; on a
+REM     real build this made backup_recipes.ps1 get called with
+REM     -BackupDir "" (empty - PowerShell rejected it outright), and even
+REM     had that been fixed, the errorlevel check right after would have
+REM     read an empty BACKUP_ERR and always taken the failure branch
+REM     regardless of the real result. "build.bat debug" (or
+REM     "--debug", either order with "nozip") prints the actual
+REM     RECIPES_DIR/BACKUP_STAMP/BACKUP_DIR values right before the
+REM     PowerShell call, to make this class of bug visible immediately
+REM     instead of surfacing as a confusing PowerShell parameter error.
 REM ===================================================================
 
 cd /d "%~dp0"
 set "PY_CMD=python"
 set "SKIP_ZIP=0"
+set "DEBUG_BUILD=0"
 if /i "%~1"=="nozip" set "SKIP_ZIP=1"
 if /i "%~1"=="--no-zip" set "SKIP_ZIP=1"
+if /i "%~2"=="nozip" set "SKIP_ZIP=1"
+if /i "%~2"=="--no-zip" set "SKIP_ZIP=1"
+if /i "%~1"=="debug" set "DEBUG_BUILD=1"
+if /i "%~1"=="--debug" set "DEBUG_BUILD=1"
+if /i "%~2"=="debug" set "DEBUG_BUILD=1"
+if /i "%~2"=="--debug" set "DEBUG_BUILD=1"
 
 REM Repo root without a trailing backslash. A trailing backslash directly
 REM before a closing quote (e.g. "%~dp0") can be misread as escaping that
@@ -383,18 +408,31 @@ REM build (PyInstaller's own cleanup cannot tolerate anything left behind
 REM either) despite being fine to lose on its own.
 set "RECIPES_DIR=%~dp0dist\TapReplay\recipes"
 set "BACKUP_DIR="
-if exist "%RECIPES_DIR%" (
-    set "BACKUP_STAMP="
-    for /f "delims=" %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BACKUP_STAMP=%%T"
-    if not defined BACKUP_STAMP set "BACKUP_STAMP=fallback_%RANDOM%%RANDOM%"
-    set "BACKUP_DIR=%TEMP%\TapReplay_recipes_backup_%BACKUP_STAMP%"
-    if exist "%BACKUP_DIR%" rmdir /s /q "%BACKUP_DIR%"
+if not exist "%RECIPES_DIR%" goto :skip_backup
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0backup_recipes.ps1" -SourceDir "%RECIPES_DIR%" -BackupDir "%BACKUP_DIR%"
-    set "BACKUP_ERR=%errorlevel%"
-    if not "%BACKUP_ERR%"=="0" goto :backup_failed
+REM BACKUP_STAMP/BACKUP_DIR are computed via powershell's Get-Date with an
+REM explicit format string (not the region-dependent %date%/%time%), so a
+REM Japanese-locale machine cannot produce an unexpected format here - if
+REM the "for /f" below fails for some other reason, BACKUP_STAMP stays
+REM undefined and the "if not defined" line right after supplies a
+REM fallback, rather than leaving BACKUP_DIR built from an empty stamp.
+set "BACKUP_STAMP="
+for /f "delims=" %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BACKUP_STAMP=%%T"
+if not defined BACKUP_STAMP set "BACKUP_STAMP=fallback_%RANDOM%%RANDOM%"
+set "BACKUP_DIR=%TEMP%\TapReplay_recipes_backup_%BACKUP_STAMP%"
+if exist "%BACKUP_DIR%" rmdir /s /q "%BACKUP_DIR%"
+
+if "%DEBUG_BUILD%"=="1" (
+    echo DEBUG: RECIPES_DIR=%RECIPES_DIR%
+    echo DEBUG: BACKUP_STAMP=%BACKUP_STAMP%
+    echo DEBUG: BACKUP_DIR=%BACKUP_DIR%
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0backup_recipes.ps1" -SourceDir "%RECIPES_DIR%" -BackupDir "%BACKUP_DIR%"
+set "BACKUP_ERR=%errorlevel%"
+if not "%BACKUP_ERR%"=="0" goto :backup_failed
+
+:skip_backup
 call %PY_CMD% -m PyInstaller --noconfirm TapReplay.spec
 
 REM Capture errorlevel immediately: any command that runs after this
@@ -403,13 +441,16 @@ REM whether PyInstaller actually succeeded.
 set "BUILD_ERR=%errorlevel%"
 
 REM Always attempt the restore, win or lose, so a PyInstaller failure
-REM never strands the backup on top of failing the build.
+REM never strands the backup on top of failing the build. Kept outside
+REM any "( ... )" block for the same reason as the backup step above -
+REM "set RESTORE_ERR=%errorlevel%" inside a block here would have
+REM captured PyInstaller's leftover errorlevel, not the "move" result.
 set "RESTORE_ERR=0"
-if defined BACKUP_DIR (
-    if exist "%RECIPES_DIR%" rmdir /s /q "%RECIPES_DIR%"
-    move "%BACKUP_DIR%" "%RECIPES_DIR%" >nul
-    set "RESTORE_ERR=%errorlevel%"
-)
+if not defined BACKUP_DIR goto :skip_restore
+if exist "%RECIPES_DIR%" rmdir /s /q "%RECIPES_DIR%"
+move "%BACKUP_DIR%" "%RECIPES_DIR%" >nul
+set "RESTORE_ERR=%errorlevel%"
+:skip_restore
 
 if not "%BUILD_ERR%"=="0" (
     echo.
