@@ -3056,7 +3056,7 @@ class PlayerThread(QtCore.QThread):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TapReplay — Android 記録＆再生")
+        self.setWindowTitle(f"TapReplay v{core.VERSION} — Android 記録＆再生")
         self.resize(560, 700)
         self.serial = None
         self.worker = None
@@ -3103,6 +3103,13 @@ class MainWindow(QtWidgets.QWidget):
             "調整、各種待ち時間など)を初期値に戻します。設定をいじりすぎて"
             "動かなくなったときの復帰用です。レシピ名・端末シリアル・通知の"
             "ON/OFFは変更しません。"))
+        btn_open_storage = QtWidgets.QPushButton("保存場所を開く")
+        btn_open_storage.clicked.connect(self.on_open_storage_folder)
+        row.addWidget(with_help(
+            btn_open_storage,
+            "レシピ(recipes フォルダ)と設定(settings.ini)が実際に"
+            "保存されている場所を、エクスプローラーで開きます。"
+            "バックアップしたいときなどに使ってください。"))
         v.addLayout(row)
 
         # タブ（記録設定 / 再生設定）
@@ -3471,6 +3478,38 @@ class MainWindow(QtWidgets.QWidget):
         self.log.setReadOnly(True)
         v.addWidget(self.log, 1)
 
+        self.append(f"TapReplay v{core.VERSION} 起動")
+
+        # レシピ・設定の保存場所を旧バージョン(exe隣接)から新しい場所
+        # (%LOCALAPPDATA%\TapReplay\)へ移行した/できなかった結果を、
+        # 起動のたびに知らせる(移行自体はcore.py側でモジュール読み込み時に
+        # 完了済み。ここでは結果を表示するだけ)。"migrated"は移行が
+        # 実際に行われた回にしか出ない(次回以降は"already_done"になり
+        # core.MIGRATION_STATUSのチェックに引っかからなくなるため、
+        # 自然と「一度だけ」の案内になる)
+        if core.MIGRATION_STATUS == "migrated":
+            self.append(f"レシピ・設定を新しい保存場所に移行しました: {core.BASE}")
+            self.append(
+                f"(旧データは {core.EXE_DIR} に recipes.migrated_backup / "
+                "settings.ini.migrated_backup として残しています。"
+                "問題なければ手動で削除してください)")
+            QtWidgets.QMessageBox.information(
+                self, "保存場所を移行しました",
+                "レシピと設定を新しい保存場所に移行しました:\n"
+                f"{core.BASE}\n\n"
+                "元のデータは念のため以下にそのまま残しています"
+                "(自動では削除されません):\n"
+                f"{core.EXE_DIR}\n"
+                "(recipes.migrated_backup / settings.ini.migrated_backup と"
+                "いう名前です。動作に問題が無ければ、手動で削除して構いません)")
+        elif core.MIGRATION_STATUS == "failed_use_legacy":
+            self.append(
+                "!! レシピ・設定を新しい保存場所へ移行できなかったため、"
+                f"今回は従来の場所を使います: {core.BASE}")
+            self.append(
+                "!! 次回起動時に自動的に再試行します"
+                "(このデータが失われることはありません)")
+
         # 起動時にadbの解決結果を必ずログへ出す。実際に接続を試みるまで
         # 気づけないと、この種の問題は切り分けに時間がかかるため
         if core.ADB_SOURCE is None:
@@ -3614,6 +3653,19 @@ class MainWindow(QtWidgets.QWidget):
             getattr(self, attr).setValue(default)
         self.ck_verify.setChecked(True)
         self.append("設定を初期値に戻しました")
+
+    def on_open_storage_folder(self):
+        """レシピ・設定の実際の保存場所(core.BASE)をエクスプローラーで開く。
+        配布exeでは%LOCALAPPDATA%\\TapReplay\\など、exeから離れた場所に
+        なり得るため、利用者が場所を確認・バックアップできる手段として
+        用意している"""
+        opened = QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(str(core.BASE)))
+        if not opened:
+            self.append(f"!! 保存場所を開けませんでした: {core.BASE}")
+            QtWidgets.QMessageBox.warning(
+                self, "開けませんでした",
+                f"保存場所を開けませんでした:\n{core.BASE}")
 
     def _set_connection_status(self, state, text):
         """接続状態を色付きで示す。state: 'connected'(緑)/'disconnected'(灰)/

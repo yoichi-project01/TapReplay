@@ -30,8 +30,8 @@ REM     it is installed separately below instead.
 REM   - Every step that can fail saves its errorlevel into its own
 REM     variable immediately after it runs, before any other command
 REM     executes. Reusing one shared/late-checked errorlevel let
-REM     earlier failures (pyinstaller, recipes restore, license copy)
-REM     go unnoticed in the past.
+REM     earlier failures (pyinstaller, license copy) go unnoticed in
+REM     the past.
 REM   - The Python version check has both a floor and a ceiling
 REM     (PY_MIN_MINOR / PY_MAX_MINOR below). A too-new Python is just as
 REM     fatal as a too-old one here: opencv-python, PySide6, adbutils and
@@ -48,17 +48,58 @@ REM     it always asks first, and never retries automatically.
 REM   - The desktop shortcut step (end of the script) never fails the
 REM     build: the exe and _internal folder already exist in dist\ at that
 REM     point, so a shortcut problem is only ever reported as a warning.
+REM   - The release ZIP step (also end of the script) is the same: it
+REM     never fails the build for the same reason, and can be skipped
+REM     entirely by running "build.bat nozip" (handy for repeated builds
+REM     during development, where the ZIP is just wasted time).
+REM   - A running TapReplay.exe is checked for up front: PyInstaller needs
+REM     to overwrite dist\TapReplay\TapReplay.exe and the DLLs under
+REM     _internal\, and Windows will not let it touch those files while
+REM     the exe built from them is still running.
+REM   - This script used to also back up and restore dist\TapReplay\
+REM     recipes\ around the PyInstaller build, because recipes/settings
+REM     used to be stored next to the exe - meaning PyInstaller's own
+REM     "wipe dist\TapReplay\ and rebuild it" step could delete a user's
+REM     recorded recipes, or fail outright if a file in there was locked.
+REM     That backup/restore (and the file-by-file, lock-diagnosing
+REM     backup_recipes.ps1 it drove) was removed once recipes/settings
+REM     moved to %LOCALAPPDATA%\TapReplay\ (see core.py's BASE/EXE_DIR
+REM     split, and _migrate_legacy_data for how existing installs move
+REM     over): dist\TapReplay\ now never contains user data for a frozen
+REM     build to begin with, confirmed by running this script twice in a
+REM     row on a real machine and checking no recipes\ folder appeared.
+REM     backup_recipes.ps1 itself, and the Restart Manager-based
+REM     lock/process diagnosis inside it, are kept in the repo rather than
+REM     deleted - see the commit that made this change for where else
+REM     that same technique could still be useful.
 REM ===================================================================
 
 cd /d "%~dp0"
 set "PY_CMD=python"
+set "SKIP_ZIP=0"
+if /i "%~1"=="nozip" set "SKIP_ZIP=1"
+if /i "%~1"=="--no-zip" set "SKIP_ZIP=1"
+
+REM Repo root without a trailing backslash. A trailing backslash directly
+REM before a closing quote (e.g. "%~dp0") can be misread as escaping that
+REM quote when passed as a command-line argument to another program
+REM (including powershell.exe), so it is stripped once here and reused
+REM below instead of passing "%~dp0" itself as an argument.
+set "ROOT_DIR=%~dp0"
+if "%ROOT_DIR:~-1%"=="\" set "ROOT_DIR=%ROOT_DIR:~0,-1%"
 
 echo ===================================================================
 echo  TapReplay build
 echo ===================================================================
 
 echo.
-echo [1/6] Checking Python environment...
+echo [1/8] Checking for a running TapReplay.exe...
+tasklist /FI "IMAGENAME eq TapReplay.exe" 2>nul | find /I "TapReplay.exe" >nul
+if not errorlevel 1 goto :tapreplay_running
+echo No running TapReplay.exe found.
+
+echo.
+echo [2/8] Checking Python environment...
 where python >nul 2>&1
 if errorlevel 1 goto :no_python
 
@@ -86,6 +127,18 @@ if %PY_MAJOR% EQU 3 if %PY_MINOR% LSS %PY_MIN_MINOR% goto :py_too_old
 if %PY_MAJOR% GTR 3 goto :py_too_new
 if %PY_MAJOR% EQU 3 if %PY_MINOR% GTR %PY_MAX_MINOR% goto :py_too_new
 goto :py_ok
+
+:tapreplay_running
+echo.
+echo ERROR: TapReplay.exe is currently running.
+echo.
+echo PyInstaller needs to overwrite dist\TapReplay\TapReplay.exe and the
+echo DLLs under _internal\, and Windows will not allow that while the
+echo exe built from them is still running.
+echo.
+echo Close TapReplay.exe, then re-run build.bat.
+pause
+exit /b 1
 
 :no_python
 echo.
@@ -226,7 +279,7 @@ exit /b 1
 echo Python version OK.
 
 echo.
-echo [2/6] Checking whether dependencies are already installed...
+echo [3/8] Checking whether dependencies are already installed...
 call %PY_CMD% -c "import cv2, numpy, PIL, PySide6, uiautomator2, adbutils, PyInstaller" >nul 2>&1
 if errorlevel 1 goto :do_install
 echo All required packages are already importable. Skipping install.
@@ -260,7 +313,7 @@ if not "%PYI_ERR%"=="0" (
 
 :verify_imports
 echo.
-echo [3/6] Verifying that dependencies actually import...
+echo [4/8] Verifying that dependencies actually import...
 call %PY_CMD% -c "import cv2, numpy, PIL, PySide6, uiautomator2, adbutils" >nul 2>&1
 if errorlevel 1 goto :import_failed
 echo OK: all required packages are importable.
@@ -281,31 +334,23 @@ exit /b 1
 
 :do_build
 echo.
-echo [4/6] Building with PyInstaller...
+echo [5/8] Building with PyInstaller...
 
 REM Build settings live in TapReplay.spec (shared with watch_build.ps1).
 REM Edit TapReplay.spec instead of adding --onedir/icon/data flags here.
 
-REM PyInstaller rebuilds dist\TapReplay from scratch, so back up the
-REM recorded recipes (recipes\) here and restore them after the build.
-set "RECIPES_DIR=%~dp0dist\TapReplay\recipes"
-set "BACKUP_DIR=%TEMP%\TapReplay_recipes_backup"
-if exist "%RECIPES_DIR%" (
-    if exist "%BACKUP_DIR%" rmdir /s /q "%BACKUP_DIR%"
-    move "%RECIPES_DIR%" "%BACKUP_DIR%" >nul
-)
+REM Re-check right before the point of no return: the dependency install
+REM above can take several minutes, long enough for someone to start the
+REM app while waiting.
+tasklist /FI "IMAGENAME eq TapReplay.exe" 2>nul | find /I "TapReplay.exe" >nul
+if not errorlevel 1 goto :tapreplay_running
 
 call %PY_CMD% -m PyInstaller --noconfirm TapReplay.spec
 
 REM Capture errorlevel immediately: any command that runs after this
-REM (move, copy, ...) would otherwise overwrite it before we can check
-REM whether PyInstaller actually succeeded.
+REM (copy, ...) would otherwise overwrite it before we can check whether
+REM PyInstaller actually succeeded.
 set "BUILD_ERR=%errorlevel%"
-
-if exist "%BACKUP_DIR%" (
-    if exist "%RECIPES_DIR%" rmdir /s /q "%RECIPES_DIR%"
-    move "%BACKUP_DIR%" "%RECIPES_DIR%" >nul
-)
 
 if not "%BUILD_ERR%"=="0" (
     echo.
@@ -328,7 +373,7 @@ if not exist "%~dp0dist\TapReplay\THIRD_PARTY_LICENSES.txt" (
 )
 
 echo.
-echo [5/6] Verifying build output...
+echo [6/8] Verifying build output...
 set "DIST_DIR=%~dp0dist\TapReplay"
 set "DIST_OK=1"
 
@@ -361,7 +406,7 @@ if "%DIST_OK%"=="0" (
 )
 
 echo.
-echo [6/6] Creating desktop shortcut...
+echo [7/8] Creating desktop shortcut...
 
 REM This never fails the build: dist\TapReplay already verified OK above,
 REM so a shortcut problem is only a warning, not a build failure.
@@ -378,9 +423,46 @@ if not errorlevel 1 (
 )
 
 echo.
+if "%SKIP_ZIP%"=="1" (
+    echo [8/8] Skipping release ZIP ^(build.bat was run with a nozip argument^).
+    goto :zip_done
+)
+echo [8/8] Creating release ZIP...
+
+REM VERSION lives in core.py (single source of truth - also shown in the
+REM window title and startup log). Dependencies were already verified
+REM importable above, so "import core" here is safe.
+set "APP_VERSION="
+for /f "delims=" %%V in ('call %PY_CMD% -c "import core; print(core.VERSION)" 2^>^&1') do set "APP_VERSION=%%V"
+echo %APP_VERSION%| findstr /r "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul 2>&1
+if errorlevel 1 (
+    echo WARNING: could not read core.VERSION ^(got "%APP_VERSION%"^). Using 0.0.0.
+    set "APP_VERSION=0.0.0"
+)
+
+set "ZIP_PATH=%~dp0dist\TapReplay_v%APP_VERSION%.zip"
+set "ZIP_RESULT="
+for /f "delims=" %%L in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0make_release_zip.ps1" -DistDir "%DIST_DIR%" -RepoRoot "%ROOT_DIR%" -OutputZip "%ZIP_PATH%" 2^>^&1') do set "ZIP_RESULT=%%L"
+
+echo %ZIP_RESULT% | findstr /b "OK:" >nul 2>&1
+if not errorlevel 1 (
+    echo Release ZIP created: %ZIP_PATH%
+) else (
+    echo WARNING: could not create the release ZIP automatically.
+    echo %ZIP_RESULT%
+    echo You can still distribute dist\TapReplay\ manually.
+)
+
+:zip_done
+echo.
 echo Done: dist\TapReplay\TapReplay.exe
 echo.
 echo Copy the whole dist\TapReplay\ folder to distribute it - it runs as-is.
 echo (adb.exe is bundled. No manual copying or PATH setup is needed.)
+if not "%SKIP_ZIP%"=="1" (
+    echo Or hand out dist\TapReplay_v%APP_VERSION%.zip instead - it unpacks to
+    echo the same thing, and is what gets attached to a GitHub Release
+    echo ^(see RELEASE.md^).
+)
 echo.
 pause
