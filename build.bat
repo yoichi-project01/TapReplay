@@ -30,8 +30,8 @@ REM     it is installed separately below instead.
 REM   - Every step that can fail saves its errorlevel into its own
 REM     variable immediately after it runs, before any other command
 REM     executes. Reusing one shared/late-checked errorlevel let
-REM     earlier failures (pyinstaller, recipes restore, license copy)
-REM     go unnoticed in the past.
+REM     earlier failures (pyinstaller, license copy) go unnoticed in
+REM     the past.
 REM   - The Python version check has both a floor and a ceiling
 REM     (PY_MIN_MINOR / PY_MAX_MINOR below). A too-new Python is just as
 REM     fatal as a too-old one here: opencv-python, PySide6, adbutils and
@@ -52,63 +52,33 @@ REM   - The release ZIP step (also end of the script) is the same: it
 REM     never fails the build for the same reason, and can be skipped
 REM     entirely by running "build.bat nozip" (handy for repeated builds
 REM     during development, where the ZIP is just wasted time).
-REM   - A running TapReplay.exe is checked for twice: once up front
-REM     (fails fast, before wasting minutes on a dependency install) and
-REM     again right before the recipes backup (in case someone started
-REM     the exe during that wait). Both checks jump to the same
-REM     :tapreplay_running label instead of being wrapped in a callable
-REM     subroutine - "exit /b" inside a "call"ed label only returns from
-REM     that call, it does not stop the whole script, so a shared
-REM     "goto" target is used instead to get a real hard stop.
-REM   - The recipes backup/restore (inside "Building with PyInstaller")
-REM     always checks the errorlevel of "move" now. It used to not check
-REM     it at all: if TapReplay.exe (or anything else) held a file open
-REM     under dist\TapReplay\recipes\, the backup "move" failed silently
-REM     and the script carried on to run PyInstaller anyway - which then
-REM     tried to delete that same locked folder itself and crashed with
-REM     a Python PermissionError (WinError 32). Confirmed on a real
-REM     build: gui.py's playback log is opened via plain open(path, "a"),
-REM     which on Windows does not set FILE_SHARE_DELETE, so any playback
-REM     log still open blocks rename/delete of the whole recipes\ tree.
-REM     The backup folder name also now includes a timestamp instead of
-REM     being fixed - a fixed name meant that if a *previous* run's
-REM     restore ever failed and left recipes sitting in the backup
-REM     folder, the *next* run's unconditional "rmdir /s /q" on that same
-REM     fixed path would silently destroy them before making its own
-REM     backup. A timestamped name means two runs never collide, so nothing
-REM     ever gets silently deleted by a later run.
-REM   - Every "set" in the backup/restore step that a later line reads
-REM     back with %VAR% is kept OUTSIDE of any "( ... )" block (using
-REM     "goto" to skip steps instead of "if (...) ( ... )"). Without
-REM     "setlocal enabledelayedexpansion", cmd.exe substitutes every
-REM     %VAR% in an entire "( ... )" block ONCE, using the values from
-REM     BEFORE the block started - not values any earlier line inside
-REM     that same block just set. A previous version of this exact
-REM     section set BACKUP_STAMP, BACKUP_DIR and BACKUP_ERR and then read
-REM     them back with %VAR% inside the same "if exist (...)" block; on a
-REM     real build this made backup_recipes.ps1 get called with
-REM     -BackupDir "" (empty - PowerShell rejected it outright), and even
-REM     had that been fixed, the errorlevel check right after would have
-REM     read an empty BACKUP_ERR and always taken the failure branch
-REM     regardless of the real result. "build.bat debug" (or
-REM     "--debug", either order with "nozip") prints the actual
-REM     RECIPES_DIR/BACKUP_STAMP/BACKUP_DIR values right before the
-REM     PowerShell call, to make this class of bug visible immediately
-REM     instead of surfacing as a confusing PowerShell parameter error.
+REM   - A running TapReplay.exe is checked for up front: PyInstaller needs
+REM     to overwrite dist\TapReplay\TapReplay.exe and the DLLs under
+REM     _internal\, and Windows will not let it touch those files while
+REM     the exe built from them is still running.
+REM   - This script used to also back up and restore dist\TapReplay\
+REM     recipes\ around the PyInstaller build, because recipes/settings
+REM     used to be stored next to the exe - meaning PyInstaller's own
+REM     "wipe dist\TapReplay\ and rebuild it" step could delete a user's
+REM     recorded recipes, or fail outright if a file in there was locked.
+REM     That backup/restore (and the file-by-file, lock-diagnosing
+REM     backup_recipes.ps1 it drove) was removed once recipes/settings
+REM     moved to %LOCALAPPDATA%\TapReplay\ (see core.py's BASE/EXE_DIR
+REM     split, and _migrate_legacy_data for how existing installs move
+REM     over): dist\TapReplay\ now never contains user data for a frozen
+REM     build to begin with, confirmed by running this script twice in a
+REM     row on a real machine and checking no recipes\ folder appeared.
+REM     backup_recipes.ps1 itself, and the Restart Manager-based
+REM     lock/process diagnosis inside it, are kept in the repo rather than
+REM     deleted - see the commit that made this change for where else
+REM     that same technique could still be useful.
 REM ===================================================================
 
 cd /d "%~dp0"
 set "PY_CMD=python"
 set "SKIP_ZIP=0"
-set "DEBUG_BUILD=0"
 if /i "%~1"=="nozip" set "SKIP_ZIP=1"
 if /i "%~1"=="--no-zip" set "SKIP_ZIP=1"
-if /i "%~2"=="nozip" set "SKIP_ZIP=1"
-if /i "%~2"=="--no-zip" set "SKIP_ZIP=1"
-if /i "%~1"=="debug" set "DEBUG_BUILD=1"
-if /i "%~1"=="--debug" set "DEBUG_BUILD=1"
-if /i "%~2"=="debug" set "DEBUG_BUILD=1"
-if /i "%~2"=="--debug" set "DEBUG_BUILD=1"
 
 REM Repo root without a trailing backslash. A trailing backslash directly
 REM before a closing quote (e.g. "%~dp0") can be misread as escaping that
@@ -162,11 +132,9 @@ goto :py_ok
 echo.
 echo ERROR: TapReplay.exe is currently running.
 echo.
-echo PyInstaller needs to delete and rebuild dist\TapReplay\ from
-echo scratch, and it cannot do that while the running exe - or a file it
-echo has open under dist\TapReplay\recipes\ (for example an active
-echo playback log) - is locked. Building over a running instance risks
-echo losing or corrupting recorded recipes.
+echo PyInstaller needs to overwrite dist\TapReplay\TapReplay.exe and the
+echo DLLs under _internal\, and Windows will not allow that while the
+echo exe built from them is still running.
 echo.
 echo Close TapReplay.exe, then re-run build.bat.
 pause
@@ -364,14 +332,6 @@ echo   %PY_CMD% -c "import cv2, numpy, PIL, PySide6, uiautomator2, adbutils"
 pause
 exit /b 1
 
-:backup_failed
-echo.
-echo Build stopped before running PyInstaller - see the details above
-echo for exactly which file (and, if it could be determined, which
-echo program) is blocking it.
-pause
-exit /b 1
-
 :do_build
 echo.
 echo [5/8] Building with PyInstaller...
@@ -385,97 +345,16 @@ REM app while waiting.
 tasklist /FI "IMAGENAME eq TapReplay.exe" 2>nul | find /I "TapReplay.exe" >nul
 if not errorlevel 1 goto :tapreplay_running
 
-REM PyInstaller rebuilds dist\TapReplay from scratch, so back up the
-REM recorded recipes (recipes\) here and restore them after the build.
-REM The backup folder name includes a timestamp (not a fixed name): a
-REM fixed name meant that if a *previous* run's restore ever failed and
-REM left recipes stranded in the backup folder, this run's own backup
-REM step would silently rmdir /s /q that same path (to make room for its
-REM own backup) before anyone noticed - destroying the stranded recipes.
-REM A per-run name means two runs never collide, so nothing prior is
-REM ever touched, let alone deleted.
-REM
-REM The actual copy/verify work is delegated to backup_recipes.ps1
-REM (invoked directly, not through a "for /f ... do set" capture, so its
-REM possibly multi-line diagnostics print straight to the console instead
-REM of only the last line surviving). It copies file-by-file rather than
-REM moving the whole folder in one shot, so a single locked file no
-REM longer fails the entire backup with just an opaque "Access is
-REM denied" - it reports exactly which file, and (best-effort, via the
-REM Restart Manager API) which process holds it. See that script for the
-REM full reasoning, including why even a locked *.log still blocks the
-REM build (PyInstaller's own cleanup cannot tolerate anything left behind
-REM either) despite being fine to lose on its own.
-set "RECIPES_DIR=%~dp0dist\TapReplay\recipes"
-set "BACKUP_DIR="
-if not exist "%RECIPES_DIR%" goto :skip_backup
-
-REM BACKUP_STAMP/BACKUP_DIR are computed via powershell's Get-Date with an
-REM explicit format string (not the region-dependent %date%/%time%), so a
-REM Japanese-locale machine cannot produce an unexpected format here - if
-REM the "for /f" below fails for some other reason, BACKUP_STAMP stays
-REM undefined and the "if not defined" line right after supplies a
-REM fallback, rather than leaving BACKUP_DIR built from an empty stamp.
-set "BACKUP_STAMP="
-for /f "delims=" %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BACKUP_STAMP=%%T"
-if not defined BACKUP_STAMP set "BACKUP_STAMP=fallback_%RANDOM%%RANDOM%"
-set "BACKUP_DIR=%TEMP%\TapReplay_recipes_backup_%BACKUP_STAMP%"
-if exist "%BACKUP_DIR%" rmdir /s /q "%BACKUP_DIR%"
-
-if "%DEBUG_BUILD%"=="1" (
-    echo DEBUG: RECIPES_DIR=%RECIPES_DIR%
-    echo DEBUG: BACKUP_STAMP=%BACKUP_STAMP%
-    echo DEBUG: BACKUP_DIR=%BACKUP_DIR%
-)
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0backup_recipes.ps1" -SourceDir "%RECIPES_DIR%" -BackupDir "%BACKUP_DIR%"
-set "BACKUP_ERR=%errorlevel%"
-if not "%BACKUP_ERR%"=="0" goto :backup_failed
-
-:skip_backup
 call %PY_CMD% -m PyInstaller --noconfirm TapReplay.spec
 
 REM Capture errorlevel immediately: any command that runs after this
-REM (move, copy, ...) would otherwise overwrite it before we can check
-REM whether PyInstaller actually succeeded.
+REM (copy, ...) would otherwise overwrite it before we can check whether
+REM PyInstaller actually succeeded.
 set "BUILD_ERR=%errorlevel%"
-
-REM Always attempt the restore, win or lose, so a PyInstaller failure
-REM never strands the backup on top of failing the build. Kept outside
-REM any "( ... )" block for the same reason as the backup step above -
-REM "set RESTORE_ERR=%errorlevel%" inside a block here would have
-REM captured PyInstaller's leftover errorlevel, not the "move" result.
-set "RESTORE_ERR=0"
-if not defined BACKUP_DIR goto :skip_restore
-if exist "%RECIPES_DIR%" rmdir /s /q "%RECIPES_DIR%"
-move "%BACKUP_DIR%" "%RECIPES_DIR%" >nul
-set "RESTORE_ERR=%errorlevel%"
-:skip_restore
 
 if not "%BUILD_ERR%"=="0" (
     echo.
     echo Build failed. Check the errors above.
-    if not "%RESTORE_ERR%"=="0" (
-        echo.
-        echo In addition, your recorded recipes could not be restored.
-        echo They were NOT lost - they are still sitting at:
-        echo   %BACKUP_DIR%
-        echo Move that folder back to dist\TapReplay\recipes\ manually.
-    )
-    pause
-    exit /b 1
-)
-
-if not "%RESTORE_ERR%"=="0" (
-    echo.
-    echo ERROR: the exe built successfully, but recorded recipes could not
-    echo be restored into dist\TapReplay\recipes\ afterward ^(likely
-    echo something still has a file open under that folder^). Your
-    echo recipes were NOT lost - they are still sitting at:
-    echo   %BACKUP_DIR%
-    echo Move that folder back to dist\TapReplay\recipes\ manually, then
-    echo re-run build.bat if you want a clean dist\TapReplay\ with
-    echo recipes already in place.
     pause
     exit /b 1
 )

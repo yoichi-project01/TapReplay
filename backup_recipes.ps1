@@ -1,3 +1,17 @@
+# NOTE (kept, currently unused by build.bat): this script backed up
+# dist\TapReplay\recipes\ around the PyInstaller build, back when recipes
+# and settings.ini were stored next to the exe. Now that core.py stores
+# them under %LOCALAPPDATA%\TapReplay\ instead (see core.py's BASE/
+# EXE_DIR split and _migrate_legacy_data), dist\TapReplay\ never contains
+# user data for a frozen build to begin with, so build.bat no longer
+# calls this script. It is kept in the repo rather than deleted: it is a
+# working, tested (three real-machine scenarios: no lock, a locked *.log,
+# a locked template image), file-by-file copy-with-lock-diagnosis
+# implementation that the planned recipe export/import feature will
+# likely need the same technique for (safely copying user data that
+# might have a file open elsewhere, and reporting exactly which file and
+# process if it does). If that feature ends up not needing it, or ends
+# up needing something shaped differently, delete this file then.
 [CmdletBinding()]
 param(
     # AllowEmptyString + a manual check further down (rather than relying

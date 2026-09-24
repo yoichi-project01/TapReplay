@@ -12,6 +12,7 @@ GUI (gui.py) から呼ばれる。単体では起動しない。
     adb devices で端末が見えること
 """
 
+import os
 import sys
 import json
 import shutil
@@ -29,17 +30,137 @@ import uiautomator2 as u2
 # ここだけ更新すればよい
 VERSION = "1.0.0"
 
-# exe 化(PyInstaller)された場合は exe のある場所を基準にする。
-# そうしないと onefile 版では記録データが一時フォルダに保存され消えてしまう。
+# exeそのものがある場所。ユーザーデータ(recipes/settings.ini)の保存先
+# ではない - それはBASE(下記)を参照すること。adb.exeの最終フォールバック
+# 探索(_resolve_adb参照)など、「exeの隣」を指したい場合にだけ使う
 if getattr(sys, "frozen", False):
-    BASE = pathlib.Path(sys.executable).parent
+    EXE_DIR = pathlib.Path(sys.executable).parent
 else:
-    BASE = pathlib.Path(__file__).parent
+    EXE_DIR = pathlib.Path(__file__).parent
+
+
+def _verify_copied_file(src, dst):
+    """コピー後、宛先が存在しサイズが一致することだけを確認する軽量な
+    検証。1バイトでもズレていれば移行失敗として扱うため、ズレていれば
+    例外を送出する(呼び出し側のtry/exceptで「移行失敗」に倒す)"""
+    if not dst.exists():
+        raise FileNotFoundError(f"コピー先が見つかりません: {dst}")
+    if dst.stat().st_size != src.stat().st_size:
+        raise ValueError(f"コピー後のサイズが一致しません: {dst}")
+
+
+def _verify_copied_tree(src_dir, dst_dir):
+    """src_dir配下の全ファイルが、dst_dir配下の同じ相対パスに同じ
+    サイズでコピーされていることを確認する"""
+    for src_file in src_dir.rglob("*"):
+        if src_file.is_dir():
+            continue
+        rel = src_file.relative_to(src_dir)
+        _verify_copied_file(src_file, dst_dir / rel)
+
+
+def _unique_sibling_name(parent, preferred_name):
+    """parent直下でpreferred_nameが既に使われていたら、末尾に連番を
+    付けて衝突しない名前を返す(過去の移行の残骸などと衝突しないため)"""
+    candidate = preferred_name
+    n = 2
+    while (parent / candidate).exists():
+        candidate = f"{preferred_name}_{n}"
+        n += 1
+    return candidate
+
+
+def _migrate_legacy_data(old_base, new_base):
+    """配布exe(frozen)専用: 旧バージョンでexeと同じ場所(old_base)に
+    保存されていたrecipes/settings.iniを、新しい保存場所(new_base)へ
+    一度だけコピーする。
+
+    move(移動)ではなくcopyを使い、コピーが完全に終わったことを
+    _verify_copied_*で確認できるまでは旧データを一切変更しない。
+    1ファイルでも失敗したら移行を確定させず、中途半端なコピーはその場で
+    削除し、このセッションではold_baseをそのまま使い続ける(次回起動時に
+    再試行する。new_base\\recipesが存在しない限り毎回再試行される)。
+
+    成功した場合のみ、旧フォルダ/ファイルを「*.migrated_backup」に
+    リネームして残す(自動削除はしない)。
+
+    戻り値: (状態, 実際に使うベースパス)
+      状態は "already_done" / "nothing_to_migrate" / "migrated" /
+      "failed_use_legacy" のいずれか。呼び出し側(gui.py)は
+      "migrated"のときだけ利用者に一度だけ案内し、"failed_use_legacy"
+      のときは警告ログを出す(いずれもMIGRATION_STATUS経由)。
+    """
+    new_recipes = new_base / "recipes"
+    if new_recipes.exists():
+        return "already_done", new_base
+
+    old_recipes = old_base / "recipes"
+    old_settings = old_base / "settings.ini"
+    if not old_recipes.exists() and not old_settings.exists():
+        return "nothing_to_migrate", new_base
+
+    new_settings = new_base / "settings.ini"
+    try:
+        if old_recipes.exists():
+            shutil.copytree(old_recipes, new_recipes)
+            _verify_copied_tree(old_recipes, new_recipes)
+        if old_settings.exists():
+            shutil.copy2(old_settings, new_settings)
+            _verify_copied_file(old_settings, new_settings)
+    except Exception:
+        # 失敗: 中途半端なコピーを残さない(残すと次回起動時の
+        # 「new_base\\recipesが既にあるか」判定を誤らせる)。旧データには
+        # 一切触れていないので、ここでは何も失われていない
+        if new_recipes.exists():
+            shutil.rmtree(new_recipes, ignore_errors=True)
+        if new_settings.exists():
+            try:
+                new_settings.unlink()
+            except Exception:
+                pass
+        return "failed_use_legacy", old_base
+
+    if old_recipes.exists():
+        backup_name = _unique_sibling_name(old_base, "recipes.migrated_backup")
+        try:
+            old_recipes.rename(old_base / backup_name)
+        except Exception:
+            pass  # リネーム失敗は移行の成否に影響しない(コピーは検証済み)
+    if old_settings.exists():
+        backup_name = _unique_sibling_name(old_base, "settings.ini.migrated_backup")
+        try:
+            old_settings.rename(old_base / backup_name)
+        except Exception:
+            pass
+    return "migrated", new_base
+
+
+if getattr(sys, "frozen", False):
+    # 配布exeは %LOCALAPPDATA%\TapReplay\ にレシピ・設定を保存する。
+    # 開発時のビルド出力(dist\TapReplay\)はPyInstallerがビルドのたびに
+    # 丸ごと削除・再構築するため、そこにユーザーデータを置くと退避・
+    # 復元が必要になり、1ファイルでもロックされていればビルド自体が
+    # 止まる不具合を過去に繰り返した(backup_recipes.ps1関連のコミット
+    # 参照)。%LOCALAPPDATA%はビルドの影響を一切受けないため、この種の
+    # 不具合が構造的に発生しなくなる。%APPDATA%(Roaming)ではなく
+    # LocalAppDataを使うのは、レシピのテンプレート画像でサイズが
+    # それなりに大きくなり得るため(Roamingはドメイン環境のローミング
+    # プロファイル同期対象になりやすく、大きいデータを置くと同期が
+    # 遅くなる)。
+    _new_base = pathlib.Path(os.environ.get("LOCALAPPDATA", str(EXE_DIR))) / "TapReplay"
+    _new_base.mkdir(parents=True, exist_ok=True)
+    MIGRATION_STATUS, BASE = _migrate_legacy_data(EXE_DIR, _new_base)
+else:
+    # 開発時(python gui.pyで直接起動)は今まで通りリポジトリ直下を使う。
+    # dist\の再構築とは無関係なので変える理由が無く、.gitignoreで既に
+    # 除外されている
+    BASE = EXE_DIR
+    MIGRATION_STATUS = None
+
 RECIPES = BASE / "recipes"
 RECIPES.mkdir(exist_ok=True)
 
-# GUIの設定(通知のON/OFFなど)の保存先。recipesと同様、exeのある場所を
-# 基準にする(exeフォルダごと配布・移動しても設定が一緒についてくるように)
+# GUIの設定(通知のON/OFFなど)の保存先。recipesと同じ場所(BASE)に置く
 SETTINGS_PATH = BASE / "settings.ini"
 
 
@@ -77,7 +198,7 @@ def _resolve_adb():
     w = shutil.which("adb")
     if w:
         return w, "PATH"
-    local = BASE / "adb.exe"
+    local = EXE_DIR / "adb.exe"
     if local.exists():
         return str(local), "実行フォルダ"
     return "adb", None

@@ -13,21 +13,12 @@ function Invoke-Build {
     $ts = Get-Date -Format 'HH:mm:ss'
     Write-Host "`n[$ts] Change detected. Building..." -ForegroundColor Cyan
 
-    # PyInstaller rebuilds dist\TapReplay from scratch, so back up the
-    # recorded recipes (recipes\) and restore them after the build.
-    $recipesDir = Join-Path $root 'dist\TapReplay\recipes'
-    $backupDir = Join-Path $env:TEMP 'TapReplay_recipes_backup'
-    if (Test-Path $recipesDir) {
-        if (Test-Path $backupDir) { Remove-Item $backupDir -Recurse -Force }
-        Move-Item $recipesDir $backupDir
-    }
-
+    # No recipes backup/restore needed here (this used to have one, same
+    # as build.bat did): recipes/settings.ini now live under
+    # %LOCALAPPDATA%\TapReplay\, not next to the exe, so PyInstaller's
+    # "wipe dist\TapReplay\ and rebuild it" step never touches user data
+    # to begin with. See core.py's BASE/EXE_DIR split.
     python -m PyInstaller --noconfirm TapReplay.spec
-
-    if (Test-Path $backupDir) {
-        if (Test-Path $recipesDir) { Remove-Item $recipesDir -Recurse -Force }
-        Move-Item $backupDir $recipesDir
-    }
 
     $ts = Get-Date -Format 'HH:mm:ss'
     if ($LASTEXITCODE -eq 0) {
